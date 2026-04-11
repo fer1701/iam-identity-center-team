@@ -30,6 +30,9 @@ jobs:
           role-to-assume: arn:aws:iam::${{ vars.MANAGEMENT_ACCOUNT }}:role/GitHubActions-TEAM-RoleA
           aws-region: ${{ vars.AWS_REGION }}
 
+      - name: Test Role A assumption
+        run: aws sts get-caller-identity
+      
       - name: Generate parameters.sh
         run: |
           cd deployment
