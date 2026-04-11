@@ -21,6 +21,10 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
 
+      - name: Debug role ARN
+        run: |
+          echo "Management Account ID from variable: ${{ vars.MANAGEMENT_ACCOUNT }}"
+          echo "Full role ARN: arn:aws:iam::${{ vars.MANAGEMENT_ACCOUNT }}:role/GitHubActions-TEAM-RoleA"
       # ---------- STEP 1: Assume Role A (Management) ----------
       - name: Configure AWS credentials (Role A)
         uses: aws-actions/configure-aws-credentials@v4
