@@ -32,24 +32,6 @@ jobs:
           role-to-assume: arn:aws:iam::${{ vars.MANAGEMENT_ACCOUNT }}:role/GitHubActions-TEAM-RoleA
           aws-region: ${{ vars.AWS_REGION }}
 
-      - name: Run init.sh (delegated admin setup)
-        run: |
-          cd deployment
-          chmod +x init.sh
-          ./init.sh
-
-      # ---------- STEP 2: Assume Role B (TEAM Account) ----------
-      - name: Configure AWS credentials (Role B)
-        uses: aws-actions/configure-aws-credentials@v4
-        with:
-          role-to-assume: ${{ secrets.TEAM_ROLE_B_ARN }}
-          aws-region: ${{ vars.AWS_REGION }}
-
-      - name: Install dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y jq
-
       - name: Generate parameters.sh
         run: |
           cd deployment
@@ -66,6 +48,25 @@ jobs:
           UI_DOMAIN="${{ vars.UI_DOMAIN }}"
           SECRET_NAME="${{ vars.SECRET_NAME }}"
           EOF
+
+      - name: Run init.sh (delegated admin setup)
+        run: |
+          cd deployment
+          chmod +x init.sh
+          ./init.sh    
+      # ---------- STEP 2: Assume Role B (TEAM Account) ----------
+      - name: Configure AWS credentials (Role B)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.TEAM_ROLE_B_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y jq
+
+      
 
       - name: Run deploy.sh
         run: |
