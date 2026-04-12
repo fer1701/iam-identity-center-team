@@ -90,6 +90,10 @@ jobs:
           # Force push to avoid "unknown commit" errors
           sed -i 's/git push origin main/git push --force origin main/' deploy.sh
 
+      - name: Delete CodeCommit repository if exists (to avoid conflict)
+        run: |
+          aws codecommit delete-repository --repository-name team-idc-app --region ${{ vars.AWS_REGION }} || echo "Repository not found, continuing."
+
       - name: Run deploy.sh
         run: |
           cd deployment
