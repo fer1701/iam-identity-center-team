@@ -96,6 +96,12 @@ jobs:
       
       - name: Unset AWS_PROFILE to use environment credentials
         run: unset AWS_PROFILE
+
+      - name: Install git-remote-codecommit
+        run: |
+          pipx install git-remote-codecommit
+          echo "Verifying installation:"
+          git-remote-codecommit || echo "Expected error (no arguments) but command found."
       
       - name: Run deploy.sh
         run: |
