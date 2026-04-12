@@ -92,6 +92,12 @@ jobs:
       - name: Delete CodeCommit repository if exists (idempotency)
         run: |
           aws codecommit delete-repository --repository-name team-idc-app --region ${{ vars.AWS_REGION }} || echo "Repository did not exist, continuing."
+
+
+      - name: Patch deploy.sh to force push
+        run: |
+          cd deployment
+          sed -i 's/git push origin main/git push --force origin main/' deploy.sh
       
       - name: Install dependencies
         run: |
