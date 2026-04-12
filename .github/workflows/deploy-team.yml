@@ -54,7 +54,9 @@ jobs:
         run: |
           # Remove any existing .git and reinitialize
           rm -rf .git
-          git init
+          git init -b main
+          git config user.email "github-actions@github.com"
+          git config user.name "GitHub Actions"
           git add .
           git commit -m "Initial commit for TEAM deployment"
           # Ensure the commit is valid
