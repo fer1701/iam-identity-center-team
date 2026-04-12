@@ -89,6 +89,10 @@ jobs:
           echo "Successfully assumed Role B"
           aws sts get-caller-identity
           
+      - name: Delete CodeCommit repository if exists (idempotency)
+        run: |
+          aws codecommit delete-repository --repository-name team-idc-app --region ${{ vars.AWS_REGION }} || echo "Repository did not exist, continuing."
+      
       - name: Install dependencies
         run: |
           sudo apt-get update
