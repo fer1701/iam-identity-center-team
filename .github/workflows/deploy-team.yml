@@ -81,7 +81,9 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y jq
       
-
+      - name: Unset AWS_PROFILE to use environment credentials
+        run: unset AWS_PROFILE
+      
       - name: Run deploy.sh
         run: |
           cd deployment
