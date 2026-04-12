@@ -50,15 +50,18 @@ jobs:
           SECRET_NAME="${{ vars.SECRET_NAME }}"
           EOF
 
-      - name: Patch deploy.sh to unset AWS_PROFILE
+      - name: Patch scripts to unset AWS_PROFILE
         run: |
           cd deployment
-          # Replace 'export AWS_PROFILE=""' with 'unset AWS_PROFILE'
-          sed -i 's/export AWS_PROFILE=""/unset AWS_PROFILE/' deploy.sh
-          # Also patch any other scripts that might cause the same issue (cognito.sh, etc.)
-          sed -i 's/export AWS_PROFILE=""/unset AWS_PROFILE/' cognito.sh 2>/dev/null || true
-          sed -i 's/export AWS_PROFILE=""/unset AWS_PROFILE/' integration.sh 2>/dev/null || true
-          sed -i 's/export AWS_PROFILE=""/unset AWS_PROFILE/' api-machine-auth.sh 2>/dev/null || true
+          # Replace the export line with unset, regardless of the variable value
+          sed -i 's/^[[:space:]]*export[[:space:]]\+AWS_PROFILE=.*/unset AWS_PROFILE/' deploy.sh
+          # Also patch other scripts
+          sed -i 's/^[[:space:]]*export[[:space:]]\+AWS_PROFILE=.*/unset AWS_PROFILE/' cognito.sh 2>/dev/null || true
+          sed -i 's/^[[:space:]]*export[[:space:]]\+AWS_PROFILE=.*/unset AWS_PROFILE/' integration.sh 2>/dev/null || true
+          sed -i 's/^[[:space:]]*export[[:space:]]\+AWS_PROFILE=.*/unset AWS_PROFILE/' api-machine-auth.sh 2>/dev/null || true
+          # Verify the change (optional)
+          echo "=== Checking deploy.sh after patching ==="
+          grep -n "AWS_PROFILE" deploy.sh || echo "No AWS_PROFILE lines found"
 
       - name: Run init.sh (delegated admin setup)
         run: |
