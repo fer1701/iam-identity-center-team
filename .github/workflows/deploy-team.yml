@@ -50,7 +50,7 @@ jobs:
           SECRET_NAME="${{ vars.SECRET_NAME }}"
           EOF
 
-            - name: Reinitialize local git repository (fresh clone)
+      - name: Reinitialize local git repository (fresh clone)
         run: |
           # Remove any existing .git and reinitialize
           rm -rf .git
