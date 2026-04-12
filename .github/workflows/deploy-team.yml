@@ -55,56 +55,31 @@ jobs:
           cd deployment
           chmod +x init.sh
           ./init.sh    
-
-      # After assuming Role A, debug current credentials and test assume Role B
-      - name: Debug Role A credentials
+                         
+      # ---------- STEP 2: Assume Role B (TEAM Account) ----------
+      - name: Assume Role B manually
         run: |
-          echo "=== Current identity (should be Role A) ==="
-          aws sts get-caller-identity
-          echo "=== Environment variables (partial) ==="
-          echo "AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID:0:10}..."
-          echo "AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY:0:10}..."
-          echo "AWS_SESSION_TOKEN: ${AWS_SESSION_TOKEN:0:10}..."
-          echo "AWS_REGION: $AWS_REGION"
-
-      - name: Test manual assumption of Role B
-        run: |
-          set -e
-          echo "=== Attempting to assume Role B: ${{ vars.TEAM_ROLE_B_ARN }} ==="
-          # Use the current credentials to call assume-role
+          # Use the current credentials (from Role A) to assume Role B
           CREDS=$(aws sts assume-role \
             --role-arn "${{ vars.TEAM_ROLE_B_ARN }}" \
-            --role-session-name "DebugSession" \
-            --duration-seconds 900 \
+            --role-session-name "GitHubActionsRoleB" \
+            --duration-seconds 3600 \
             --output json)
           
-          echo "Assume role succeeded."
-          echo "New credentials (partial):"
-          echo "AccessKeyId: $(echo "$CREDS" | jq -r .Credentials.AccessKeyId | cut -c1-10)..."
-          echo "SecretAccessKey: $(echo "$CREDS" | jq -r .Credentials.SecretAccessKey | cut -c1-10)..."
-          echo "SessionToken: $(echo "$CREDS" | jq -r .Credentials.SessionToken | cut -c1-10)..."
+          # Export the new credentials to the environment for subsequent steps
+          echo "AWS_ACCESS_KEY_ID=$(echo $CREDS | jq -r .Credentials.AccessKeyId)" >> $GITHUB_ENV
+          echo "AWS_SECRET_ACCESS_KEY=$(echo $CREDS | jq -r .Credentials.SecretAccessKey)" >> $GITHUB_ENV
+          echo "AWS_SESSION_TOKEN=$(echo $CREDS | jq -r .Credentials.SessionToken)" >> $GITHUB_ENV
+          echo "AWS_REGION=${{ vars.AWS_REGION }}" >> $GITHUB_ENV
+          echo "AWS_DEFAULT_REGION=${{ vars.AWS_REGION }}" >> $GITHUB_ENV
           
-          # Test the assumed role identity
-          export AWS_ACCESS_KEY_ID=$(echo "$CREDS" | jq -r .Credentials.AccessKeyId)
-          export AWS_SECRET_ACCESS_KEY=$(echo "$CREDS" | jq -r .Credentials.SecretAccessKey)
-          export AWS_SESSION_TOKEN=$(echo "$CREDS" | jq -r .Credentials.SessionToken)
-          
-          echo "=== Identity after assuming Role B ==="
+          echo "Successfully assumed Role B"
           aws sts get-caller-identity
-
           
-      # ---------- STEP 2: Assume Role B (TEAM Account) ----------
-      - name: Configure AWS credentials (Role B)
-        uses: aws-actions/configure-aws-credentials@v4
-        with:
-          role-to-assume: ${{ vars.TEAM_ROLE_B_ARN }}
-          aws-region: ${{ vars.AWS_REGION }}
-
       - name: Install dependencies
         run: |
           sudo apt-get update
           sudo apt-get install -y jq
-
       
 
       - name: Run deploy.sh
