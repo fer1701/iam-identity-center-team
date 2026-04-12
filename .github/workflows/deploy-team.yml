@@ -21,18 +21,13 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
 
-      - name: Debug role ARN
-        run: echo "arn:aws:iam::${{ vars.MANAGEMENT_ACCOUNT }}:role/GitHubActions-TEAM-RoleA"
-      # ---------- STEP 1: Assume Role A (Management) ----------
+      # ---------- STEP 1: Assume Role A (Management) for init.sh ----------
       - name: Configure AWS credentials (Role A)
         uses: aws-actions/configure-aws-credentials@v4
         with:
           role-to-assume: arn:aws:iam::${{ vars.MANAGEMENT_ACCOUNT }}:role/GitHubActions-TEAM-RoleA
           aws-region: ${{ vars.AWS_REGION }}
 
-      - name: Test Role A assumption
-        run: aws sts get-caller-identity
-      
       - name: Generate parameters.sh
         run: |
           cd deployment
@@ -50,100 +45,51 @@ jobs:
           SECRET_NAME="${{ vars.SECRET_NAME }}"
           EOF
 
-      - name: Reinitialize local git repository (fresh clone)
+      - name: Run init.sh (delegated admin setup)
         run: |
-          # Remove any existing .git and reinitialize
+          cd deployment
+          chmod +x init.sh
+          ./init.sh
+
+      # ---------- STEP 2: Assume Role B (TEAM account) for deployment ----------
+      - name: Assume Role B manually
+        run: |
+          CREDS=$(aws sts assume-role \
+            --role-arn "${{ vars.TEAM_ROLE_B_ARN }}" \
+            --role-session-name "GitHubActionsRoleB" \
+            --duration-seconds 3600 \
+            --output json)
+          echo "AWS_ACCESS_KEY_ID=$(echo $CREDS | jq -r .Credentials.AccessKeyId)" >> $GITHUB_ENV
+          echo "AWS_SECRET_ACCESS_KEY=$(echo $CREDS | jq -r .Credentials.SecretAccessKey)" >> $GITHUB_ENV
+          echo "AWS_SESSION_TOKEN=$(echo $CREDS | jq -r .Credentials.SessionToken)" >> $GITHUB_ENV
+          echo "AWS_REGION=${{ vars.AWS_REGION }}" >> $GITHUB_ENV
+          echo "AWS_DEFAULT_REGION=${{ vars.AWS_REGION }}" >> $GITHUB_ENV
+          echo "Successfully assumed Role B"
+          aws sts get-caller-identity
+
+      - name: Install git-remote-codecommit
+        run: |
+          pipx install git-remote-codecommit
+          echo "$HOME/.local/bin" >> $GITHUB_PATH
+
+      - name: Reinitialize local git repository (fresh commit)
+        run: |
           rm -rf .git
           git init -b main
           git config user.email "github-actions@github.com"
           git config user.name "GitHub Actions"
           git add .
           git commit -m "Initial commit for TEAM deployment"
-          # Ensure the commit is valid
           git fsck
 
-      - name: Create CodeCommit repository (if not exists)
-        run: |
-          aws codecommit create-repository --repository-name team-idc-app --region ${{ vars.AWS_REGION }} || echo "Repository already exists, continuing."
-
-      - name: Push code to CodeCommit manually
-        run: |
-          git remote add origin codecommit::us-east-1://team-idc-app
-          git push --force origin main
-
-      - name: Patch deploy.sh to skip git push commands
+      - name: Patch deploy.sh
         run: |
           cd deployment
-          # Comment out the lines that create repository, remove remote, add remote, and push
-          sed -i 's/^[[:space:]]*aws codecommit create-repository/# &/' deploy.sh
-          sed -i 's/^[[:space:]]*git remote remove origin/# &/' deploy.sh
-          sed -i 's/^[[:space:]]*git remote add origin/# &/' deploy.sh
-          sed -i 's/^[[:space:]]*git push origin main/# &/' deploy.sh
-          # Also ensure AWS_PROFILE is unset (already patched)
-
-      - name: Patch scripts to unset AWS_PROFILE
-        run: |
-          cd deployment
-          # Replace the export line with unset, regardless of the variable value
+          # Unset AWS_PROFILE instead of exporting empty
           sed -i 's/^[[:space:]]*export[[:space:]]\+AWS_PROFILE=.*/unset AWS_PROFILE/' deploy.sh
-          # Also patch other scripts
-          sed -i 's/^[[:space:]]*export[[:space:]]\+AWS_PROFILE=.*/unset AWS_PROFILE/' cognito.sh 2>/dev/null || true
-          sed -i 's/^[[:space:]]*export[[:space:]]\+AWS_PROFILE=.*/unset AWS_PROFILE/' integration.sh 2>/dev/null || true
-          sed -i 's/^[[:space:]]*export[[:space:]]\+AWS_PROFILE=.*/unset AWS_PROFILE/' api-machine-auth.sh 2>/dev/null || true
-          # Verify the change (optional)
-          echo "=== Checking deploy.sh after patching ==="
-          grep -n "AWS_PROFILE" deploy.sh || echo "No AWS_PROFILE lines found"
-
-      - name: Run init.sh (delegated admin setup)
-        run: |
-          cd deployment
-          chmod +x init.sh
-          ./init.sh    
-                         
-      # ---------- STEP 2: Assume Role B (TEAM Account) ----------
-      - name: Assume Role B manually
-        run: |
-          # Use the current credentials (from Role A) to assume Role B
-          CREDS=$(aws sts assume-role \
-            --role-arn "${{ vars.TEAM_ROLE_B_ARN }}" \
-            --role-session-name "GitHubActionsRoleB" \
-            --duration-seconds 3600 \
-            --output json)
-          
-          # Export the new credentials to the environment for subsequent steps
-          echo "AWS_ACCESS_KEY_ID=$(echo $CREDS | jq -r .Credentials.AccessKeyId)" >> $GITHUB_ENV
-          echo "AWS_SECRET_ACCESS_KEY=$(echo $CREDS | jq -r .Credentials.SecretAccessKey)" >> $GITHUB_ENV
-          echo "AWS_SESSION_TOKEN=$(echo $CREDS | jq -r .Credentials.SessionToken)" >> $GITHUB_ENV
-          echo "AWS_REGION=${{ vars.AWS_REGION }}" >> $GITHUB_ENV
-          echo "AWS_DEFAULT_REGION=${{ vars.AWS_REGION }}" >> $GITHUB_ENV
-          
-          echo "Successfully assumed Role B"
-          aws sts get-caller-identity
-          
-      - name: Delete CodeCommit repository if exists (idempotency)
-        run: |
-          aws codecommit delete-repository --repository-name team-idc-app --region ${{ vars.AWS_REGION }} || echo "Repository did not exist, continuing."
-
-
-      - name: Patch deploy.sh to force push
-        run: |
-          cd deployment
+          # Force push to avoid "unknown commit" errors
           sed -i 's/git push origin main/git push --force origin main/' deploy.sh
-      
-      - name: Install dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y jq
-      
-      - name: Unset AWS_PROFILE to use environment credentials
-        run: unset AWS_PROFILE
 
-      - name: Install git-remote-codecommit
-        run: |
-          pipx install git-remote-codecommit
-          echo "Verifying installation:"
-          git-remote-codecommit || echo "Expected error (no arguments) but command found."
-      
       - name: Run deploy.sh
         run: |
           cd deployment
@@ -169,17 +115,12 @@ jobs:
         run: |
           cd deployment
           ./integration.sh > /tmp/saml.txt
-          START_URL=$(grep applicationStartURL /tmp/saml.txt | cut -d' ' -f2)
-          ACS_URL=$(grep applicationACSURL /tmp/saml.txt | cut -d' ' -f2)
-          AUDIENCE=$(grep applicationSAMLAudience /tmp/saml.txt | cut -d' ' -f2)
-          echo "START_URL=$START_URL" >> $GITHUB_OUTPUT
-          echo "ACS_URL=$ACS_URL" >> $GITHUB_OUTPUT
-          echo "AUDIENCE=$AUDIENCE" >> $GITHUB_OUTPUT
+          echo "START_URL=$(grep applicationStartURL /tmp/saml.txt | cut -d' ' -f2)" >> $GITHUB_OUTPUT
+          echo "ACS_URL=$(grep applicationACSURL /tmp/saml.txt | cut -d' ' -f2)" >> $GITHUB_OUTPUT
+          echo "AUDIENCE=$(grep applicationSAMLAudience /tmp/saml.txt | cut -d' ' -f2)" >> $GITHUB_OUTPUT
 
-      # ---------- STEP 3: Create SAML Application in IAM Identity Center ----------
-      # This step assumes we are still using Role B, but the SAML app must be created in the management account.
-      # So we need to switch back to management account credentials.
-      - name: Switch to management account (for SAML app creation)
+      # ---------- STEP 3: Create SAML App in management account ----------
+      - name: Switch to management account (Role A)
         uses: aws-actions/configure-aws-credentials@v4
         with:
           role-to-assume: arn:aws:iam::${{ vars.MANAGEMENT_ACCOUNT }}:role/GitHubActions-TEAM-RoleA
@@ -188,10 +129,8 @@ jobs:
       - name: Create or update SAML 2.0 application
         id: saml_app
         run: |
-          # Check if app already exists
           APP_ARN=$(aws sso-admin list-applications --region ${{ vars.AWS_REGION }} --query "Applications[?Name=='TEAM-IDC-APP'].ApplicationArn" --output text)
           if [ -z "$APP_ARN" ]; then
-            echo "Creating new SAML application..."
             APP_ARN=$(aws sso-admin create-application \
               --name "TEAM-IDC-APP" \
               --description "TEAM Temporary Elevated Access Management" \
@@ -199,25 +138,19 @@ jobs:
               --portal-options "SignInUrl=${{ steps.saml.outputs.START_URL }}" \
               --query "ApplicationArn" --output text)
           else
-            echo "Updating existing SAML application: $APP_ARN"
             aws sso-admin update-application \
               --application-arn "$APP_ARN" \
               --portal-options "SignInUrl=${{ steps.saml.outputs.START_URL }}"
           fi
-          # Set ACS URL and Audience (requires the application metadata – simplified)
-          # In a full implementation, you would update the application's SAML configuration.
-          # For now, we rely on the fact that the application is created with the correct values.
-          # Retrieve the application's metadata URL
           INSTANCE_ARN=$(aws sso-admin list-instances --region ${{ vars.AWS_REGION }} --query "Instances[0].InstanceArn" --output text)
           METADATA_URL="https://portal.sso.${{ vars.AWS_REGION }}.amazonaws.com/saml/metadata/$(echo $INSTANCE_ARN | cut -d'/' -f2)"
           echo "METADATA_URL=$METADATA_URL" >> $GITHUB_OUTPUT
-          echo "APP_ARN=$APP_ARN" >> $GITHUB_OUTPUT
 
-      # ---------- STEP 4: Configure Cognito with the SAML provider ----------
-      - name: Switch back to TEAM account role for cognito.sh
+      # ---------- STEP 4: Configure Cognito (back to TEAM account) ----------
+      - name: Switch back to TEAM account (Role B)
         uses: aws-actions/configure-aws-credentials@v4
         with:
-          role-to-assume: ${{ secrets.TEAM_ROLE_B_ARN }}
+          role-to-assume: ${{ vars.TEAM_ROLE_B_ARN }}
           aws-region: ${{ vars.AWS_REGION }}
 
       - name: Run cognito.sh
@@ -231,7 +164,7 @@ jobs:
         run: |
           cd deployment
           chmod +x api-machine-auth.sh
-          ./api-machine-auth.sh || echo "Machine auth setup skipped or failed."
+          ./api-machine-auth.sh || echo "Machine auth setup skipped."
 
       - name: Verify deployment
         run: |
