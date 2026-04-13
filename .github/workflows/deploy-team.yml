@@ -97,6 +97,12 @@ jobs:
         run: |
           aws codecommit delete-repository --repository-name team-idc-app --region ${{ vars.AWS_REGION }} || echo "Repository not found, continuing."
 
+      - name: Delete existing CloudFormation stack if in failed state
+        run: |
+          aws cloudformation delete-stack --stack-name TEAM-IDC-APP --region ${{ vars.AWS_REGION }} || echo "Stack does not exist or already deleted"
+          # Wait for deletion to complete (optional, but recommended)
+          aws cloudformation wait stack-delete-complete --stack-name TEAM-IDC-APP --region ${{ vars.AWS_REGION }} || echo "No stack to wait for"
+
       - name: Run deploy.sh
         run: |
           cd deployment
