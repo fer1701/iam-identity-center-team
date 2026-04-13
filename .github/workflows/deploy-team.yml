@@ -137,6 +137,10 @@ jobs:
           echo "ACS_URL=$(grep applicationACSURL /tmp/saml.txt | cut -d' ' -f2)" >> $GITHUB_OUTPUT
           echo "AUDIENCE=$(grep applicationSAMLAudience /tmp/saml.txt | cut -d' ' -f2)" >> $GITHUB_OUTPUT
 
+
+      - name: Debug START_URL
+        run: echo "START_URL = ${{ steps.saml.outputs.START_URL }}"
+        
       - name: Create or update SAML 2.0 application
         id: saml_app
         run: |
