@@ -86,21 +86,17 @@ jobs:
       - name: Patch deploy.sh
         run: |
           cd deployment
-          # Unset AWS_PROFILE
           sed -i 's/^[[:space:]]*export[[:space:]]\+AWS_PROFILE=.*/unset AWS_PROFILE/' deploy.sh
-          # Force push
           sed -i 's/git push origin main/git push --force origin main/' deploy.sh
-          # Make remote remove ignore errors (if remote doesn't exist)
           sed -i 's/git remote remove origin/git remote remove origin || true/' deploy.sh
 
-      - name: Delete CodeCommit repository if exists (to avoid conflict)
+      - name: Delete CodeCommit repository if exists (idempotency)
         run: |
           aws codecommit delete-repository --repository-name team-idc-app --region ${{ vars.AWS_REGION }} || echo "Repository not found, continuing."
 
       - name: Delete existing CloudFormation stack if in failed state
         run: |
           aws cloudformation delete-stack --stack-name TEAM-IDC-APP --region ${{ vars.AWS_REGION }} || echo "Stack does not exist or already deleted"
-          # Wait for deletion to complete (optional, but recommended)
           aws cloudformation wait stack-delete-complete --stack-name TEAM-IDC-APP --region ${{ vars.AWS_REGION }} || echo "No stack to wait for"
 
       - name: Run deploy.sh
@@ -123,44 +119,50 @@ jobs:
             done
           fi
 
-      - name: Run integration.sh and capture SAML parameters
-        id: saml
-        run: |
-          cd deployment
-          ./integration.sh > /tmp/saml.txt
-          echo "START_URL=$(grep applicationStartURL /tmp/saml.txt | cut -d' ' -f2)" >> $GITHUB_OUTPUT
-          echo "ACS_URL=$(grep applicationACSURL /tmp/saml.txt | cut -d' ' -f2)" >> $GITHUB_OUTPUT
-          echo "AUDIENCE=$(grep applicationSAMLAudience /tmp/saml.txt | cut -d' ' -f2)" >> $GITHUB_OUTPUT
-
-      # ---------- STEP 3: Create SAML App in management account ----------
-      - name: Switch to management account (Role A)
+      # ---------- STEP 3: SAML Integration (needs management account) ----------
+      - name: Switch to management account (Role A) for SAML app
         uses: aws-actions/configure-aws-credentials@v4
         with:
           role-to-assume: arn:aws:iam::${{ vars.MANAGEMENT_ACCOUNT }}:role/GitHubActions-TEAM-RoleA
           aws-region: ${{ vars.AWS_REGION }}
 
+      - name: Run integration.sh and capture SAML parameters
+        id: saml
+        run: |
+          cd deployment
+          # Patch integration.sh to unset AWS_PROFILE
+          sed -i 's/^[[:space:]]*export[[:space:]]\+AWS_PROFILE=.*/unset AWS_PROFILE/' integration.sh
+          ./integration.sh > /tmp/saml.txt
+          echo "START_URL=$(grep applicationStartURL /tmp/saml.txt | cut -d' ' -f2)" >> $GITHUB_OUTPUT
+          echo "ACS_URL=$(grep applicationACSURL /tmp/saml.txt | cut -d' ' -f2)" >> $GITHUB_OUTPUT
+          echo "AUDIENCE=$(grep applicationSAMLAudience /tmp/saml.txt | cut -d' ' -f2)" >> $GITHUB_OUTPUT
+
       - name: Create or update SAML 2.0 application
         id: saml_app
         run: |
-          APP_ARN=$(aws sso-admin list-applications --region ${{ vars.AWS_REGION }} --query "Applications[?Name=='TEAM-IDC-APP'].ApplicationArn" --output text)
+          INSTANCE_ARN=$(aws sso-admin list-instances --region ${{ vars.AWS_REGION }} --query "Instances[0].InstanceArn" --output text)
+          APP_ARN=$(aws sso-admin list-applications --region ${{ vars.AWS_REGION }} --instance-arn "$INSTANCE_ARN" --query "Applications[?Name=='TEAM-IDC-APP'].ApplicationArn" --output text)
           if [ -z "$APP_ARN" ]; then
+            echo "Creating new SAML application..."
             APP_ARN=$(aws sso-admin create-application \
               --name "TEAM-IDC-APP" \
               --description "TEAM Temporary Elevated Access Management" \
               --application-provider-arn "arn:aws:sso::aws:applicationProvider/custom" \
+              --instance-arn "$INSTANCE_ARN" \
               --portal-options "SignInUrl=${{ steps.saml.outputs.START_URL }}" \
               --query "ApplicationArn" --output text)
           else
+            echo "Updating existing SAML application: $APP_ARN"
             aws sso-admin update-application \
               --application-arn "$APP_ARN" \
               --portal-options "SignInUrl=${{ steps.saml.outputs.START_URL }}"
           fi
-          INSTANCE_ARN=$(aws sso-admin list-instances --region ${{ vars.AWS_REGION }} --query "Instances[0].InstanceArn" --output text)
           METADATA_URL="https://portal.sso.${{ vars.AWS_REGION }}.amazonaws.com/saml/metadata/$(echo $INSTANCE_ARN | cut -d'/' -f2)"
           echo "METADATA_URL=$METADATA_URL" >> $GITHUB_OUTPUT
+          echo "APP_ARN=$APP_ARN" >> $GITHUB_OUTPUT
 
       # ---------- STEP 4: Configure Cognito (back to TEAM account) ----------
-      - name: Switch back to TEAM account (Role B)
+      - name: Switch back to TEAM account (Role B) for cognito.sh
         uses: aws-actions/configure-aws-credentials@v4
         with:
           role-to-assume: ${{ vars.TEAM_ROLE_B_ARN }}
@@ -170,12 +172,14 @@ jobs:
         run: |
           cd deployment
           echo '{"MetadataURL": "${{ steps.saml_app.outputs.METADATA_URL }}"}' > details.json
+          sed -i 's/^[[:space:]]*export[[:space:]]\+AWS_PROFILE=.*/unset AWS_PROFILE/' cognito.sh
           chmod +x cognito.sh
           ./cognito.sh
 
       - name: (Optional) Setup machine authentication
         run: |
           cd deployment
+          sed -i 's/^[[:space:]]*export[[:space:]]\+AWS_PROFILE=.*/unset AWS_PROFILE/' api-machine-auth.sh
           chmod +x api-machine-auth.sh
           ./api-machine-auth.sh || echo "Machine auth setup skipped."
 
