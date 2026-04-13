@@ -85,10 +85,12 @@ jobs:
       - name: Patch deploy.sh
         run: |
           cd deployment
-          # Unset AWS_PROFILE instead of exporting empty
+          # Unset AWS_PROFILE
           sed -i 's/^[[:space:]]*export[[:space:]]\+AWS_PROFILE=.*/unset AWS_PROFILE/' deploy.sh
-          # Force push to avoid "unknown commit" errors
+          # Force push
           sed -i 's/git push origin main/git push --force origin main/' deploy.sh
+          # Make remote remove ignore errors (if remote doesn't exist)
+          sed -i 's/git remote remove origin/git remote remove origin || true/' deploy.sh
 
       - name: Delete CodeCommit repository if exists (to avoid conflict)
         run: |
