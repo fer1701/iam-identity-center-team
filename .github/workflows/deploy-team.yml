@@ -2,26 +2,33 @@ name: Deploy TEAM Application (Full Automated)
 
 on:
   push:
-    branches: [ "main" ]
+    branches: ["main"]
   workflow_dispatch:
 
 permissions:
   id-token: write
   contents: read
 
+concurrency:
+  group: deploy-team-main
+  cancel-in-progress: false
+
 env:
   AWS_REGION: ${{ vars.AWS_REGION }}
   MANAGEMENT_ACCOUNT: ${{ vars.MANAGEMENT_ACCOUNT }}
   TEAM_ACCOUNT: ${{ vars.TEAM_ACCOUNT }}
+  TEAM_ROLE_B_ARN: ${{ vars.TEAM_ROLE_B_ARN }}
 
 jobs:
   deploy:
     runs-on: ubuntu-latest
+    timeout-minutes: 120
+
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
 
-      # ---------- STEP 1: Assume Role A (Management) for init.sh ----------
+      # Step 1: Management account setup (Role A)
       - name: Configure AWS credentials (Role A)
         uses: aws-actions/configure-aws-credentials@v4
         with:
@@ -29,9 +36,9 @@ jobs:
           aws-region: ${{ vars.AWS_REGION }}
 
       - name: Generate parameters.sh
+        shell: bash
         run: |
-          cd deployment
-          cat > parameters.sh <<EOF
+          cat > deployment/parameters.sh <<'EOF'
           IDC_LOGIN_URL="${{ vars.IDC_LOGIN_URL }}"
           REGION="${{ vars.AWS_REGION }}"
           TEAM_ACCOUNT="${{ vars.TEAM_ACCOUNT }}"
@@ -47,86 +54,83 @@ jobs:
           EOF
 
       - name: Run init.sh (delegated admin setup)
+        shell: bash
         run: |
-          cd deployment
-          chmod +x init.sh
-          ./init.sh
+          chmod +x deployment/init.sh
+          ./deployment/init.sh
 
-      # ---------- STEP 2: Assume Role B (TEAM account) for deployment ----------
-      - name: Assume Role B manually
-        run: |
-          CREDS=$(aws sts assume-role \
-            --role-arn "${{ vars.TEAM_ROLE_B_ARN }}" \
-            --role-session-name "GitHubActionsRoleB" \
-            --duration-seconds 3600 \
-            --output json)
-          echo "AWS_ACCESS_KEY_ID=$(echo $CREDS | jq -r .Credentials.AccessKeyId)" >> $GITHUB_ENV
-          echo "AWS_SECRET_ACCESS_KEY=$(echo $CREDS | jq -r .Credentials.SecretAccessKey)" >> $GITHUB_ENV
-          echo "AWS_SESSION_TOKEN=$(echo $CREDS | jq -r .Credentials.SessionToken)" >> $GITHUB_ENV
-          echo "AWS_REGION=${{ vars.AWS_REGION }}" >> $GITHUB_ENV
-          echo "AWS_DEFAULT_REGION=${{ vars.AWS_REGION }}" >> $GITHUB_ENV
-          echo "Successfully assumed Role B"
-          aws sts get-caller-identity
+      # Step 2: TEAM account deployment (Role B)
+      - name: Configure AWS credentials (Role B)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.TEAM_ROLE_B_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
 
-      - name: Install git-remote-codecommit
+      - name: Install dependencies for deploy scripts
+        shell: bash
         run: |
+          python3 -m pip install --user pipx
+          python3 -m pipx ensurepath
           pipx install git-remote-codecommit
-          echo "$HOME/.local/bin" >> $GITHUB_PATH
-
-      - name: Reinitialize local git repository (fresh commit)
-        run: |
-          rm -rf .git
-          git init -b main
-          git config user.email "github-actions@github.com"
-          git config user.name "GitHub Actions"
-          git add .
-          git commit -m "Initial commit for TEAM deployment"
-          git fsck
-
-      - name: Patch deploy.sh
-        run: |
-          cd deployment
-          # Unset AWS_PROFILE
-          sed -i 's/^[[:space:]]*export[[:space:]]\+AWS_PROFILE=.*/unset AWS_PROFILE/' deploy.sh
-          # Force push
-          sed -i 's/git push origin main/git push --force origin main/' deploy.sh
-          # Make remote remove ignore errors (if remote doesn't exist)
-          sed -i 's/git remote remove origin/git remote remove origin || true/' deploy.sh
-
-      - name: Delete CodeCommit repository if exists (to avoid conflict)
-        run: |
-          aws codecommit delete-repository --repository-name team-idc-app --region ${{ vars.AWS_REGION }} || echo "Repository not found, continuing."
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
 
       - name: Run deploy.sh
+        shell: bash
         run: |
-          cd deployment
-          chmod +x deploy.sh
-          ./deploy.sh
+          chmod +x deployment/deploy.sh
+          ./deployment/deploy.sh
 
-      - name: Wait for Amplify deployment
+      - name: Wait for Amplify app availability
+        shell: bash
         run: |
-          APP_ID=$(aws cloudformation describe-stacks --stack-name TEAM-IDC-APP --query "Stacks[0].Outputs[?OutputKey=='AppId'].OutputValue" --output text)
-          if [ -n "$APP_ID" ]; then
-            echo "Amplify App ID: $APP_ID"
-            while true; do
-              STATUS=$(aws amplify get-app --app-id $APP_ID --query "app.status" --output text)
-              echo "Amplify status: $STATUS"
-              if [ "$STATUS" = "AVAILABLE" ]; then break; fi
-              if [ "$STATUS" = "FAILED" ]; then exit 1; fi
-              sleep 30
-            done
+          APP_ID="$(aws cloudformation describe-stacks \
+            --stack-name TEAM-IDC-APP \
+            --query "Stacks[0].Outputs[?OutputKey=='AppId'].OutputValue" \
+            --output text)"
+          if [ -z "$APP_ID" ] || [ "$APP_ID" = "None" ]; then
+            echo "No AppId output found on stack TEAM-IDC-APP"
+            exit 1
           fi
+
+          echo "Amplify App ID: $APP_ID"
+          for i in {1..60}; do
+            STATUS="$(aws amplify get-app --app-id "$APP_ID" --query 'app.status' --output text)"
+            echo "Amplify status: $STATUS (attempt $i/60)"
+            if [ "$STATUS" = "AVAILABLE" ]; then
+              exit 0
+            fi
+            if [ "$STATUS" = "FAILED" ]; then
+              echo "Amplify app status FAILED"
+              exit 1
+            fi
+            sleep 30
+          done
+
+          echo "Timed out waiting for Amplify app to become AVAILABLE"
+          exit 1
 
       - name: Run integration.sh and capture SAML parameters
         id: saml
+        shell: bash
         run: |
-          cd deployment
-          ./integration.sh > /tmp/saml.txt
-          echo "START_URL=$(grep applicationStartURL /tmp/saml.txt | cut -d' ' -f2)" >> $GITHUB_OUTPUT
-          echo "ACS_URL=$(grep applicationACSURL /tmp/saml.txt | cut -d' ' -f2)" >> $GITHUB_OUTPUT
-          echo "AUDIENCE=$(grep applicationSAMLAudience /tmp/saml.txt | cut -d' ' -f2)" >> $GITHUB_OUTPUT
+          chmod +x deployment/integration.sh
+          ./deployment/integration.sh > /tmp/saml.txt
 
-      # ---------- STEP 3: Create SAML App in management account ----------
+          START_URL="$(awk '/applicationStartURL/ {print $2}' /tmp/saml.txt | tail -1)"
+          ACS_URL="$(awk '/applicationACSURL/ {print $2}' /tmp/saml.txt | tail -1)"
+          AUDIENCE="$(awk '/applicationSAMLAudience/ {print $2}' /tmp/saml.txt | tail -1)"
+
+          if [ -z "$START_URL" ] || [ -z "$ACS_URL" ] || [ -z "$AUDIENCE" ]; then
+            echo "Failed to parse SAML values from integration.sh output"
+            cat /tmp/saml.txt
+            exit 1
+          fi
+
+          echo "START_URL=$START_URL" >> "$GITHUB_OUTPUT"
+          echo "ACS_URL=$ACS_URL" >> "$GITHUB_OUTPUT"
+          echo "AUDIENCE=$AUDIENCE" >> "$GITHUB_OUTPUT"
+
+      # Step 3: Create/update SAML app in management account (Role A)
       - name: Switch to management account (Role A)
         uses: aws-actions/configure-aws-credentials@v4
         with:
@@ -135,25 +139,48 @@ jobs:
 
       - name: Create or update SAML 2.0 application
         id: saml_app
+        shell: bash
         run: |
-          APP_ARN=$(aws sso-admin list-applications --region ${{ vars.AWS_REGION }} --query "Applications[?Name=='TEAM-IDC-APP'].ApplicationArn" --output text)
-          if [ -z "$APP_ARN" ]; then
-            APP_ARN=$(aws sso-admin create-application \
+          INSTANCE_ARN="$(aws sso-admin list-instances \
+            --region "${{ vars.AWS_REGION }}" \
+            --query "Instances[0].InstanceArn" \
+            --output text)"
+
+          if [ -z "$INSTANCE_ARN" ] || [ "$INSTANCE_ARN" = "None" ]; then
+            echo "Could not determine IAM Identity Center instance ARN"
+            exit 1
+          fi
+
+          APP_ARN="$(aws sso-admin list-applications \
+            --instance-arn "$INSTANCE_ARN" \
+            --region "${{ vars.AWS_REGION }}" \
+            --query "Applications[?Name=='TEAM-IDC-APP'].ApplicationArn | [0]" \
+            --output text)"
+
+          PORTAL_JSON="$(printf '{"SignInUrl":"%s"}' "${{ steps.saml.outputs.START_URL }}")"
+
+          if [ -z "$APP_ARN" ] || [ "$APP_ARN" = "None" ]; then
+            APP_ARN="$(aws sso-admin create-application \
+              --instance-arn "$INSTANCE_ARN" \
               --name "TEAM-IDC-APP" \
               --description "TEAM Temporary Elevated Access Management" \
               --application-provider-arn "arn:aws:sso::aws:applicationProvider/custom" \
-              --portal-options "SignInUrl=${{ steps.saml.outputs.START_URL }}" \
-              --query "ApplicationArn" --output text)
+              --portal-options "$PORTAL_JSON" \
+              --query "ApplicationArn" \
+              --output text)"
           else
             aws sso-admin update-application \
+              --instance-arn "$INSTANCE_ARN" \
               --application-arn "$APP_ARN" \
-              --portal-options "SignInUrl=${{ steps.saml.outputs.START_URL }}"
+              --portal-options "$PORTAL_JSON" \
+              --region "${{ vars.AWS_REGION }}"
           fi
-          INSTANCE_ARN=$(aws sso-admin list-instances --region ${{ vars.AWS_REGION }} --query "Instances[0].InstanceArn" --output text)
-          METADATA_URL="https://portal.sso.${{ vars.AWS_REGION }}.amazonaws.com/saml/metadata/$(echo $INSTANCE_ARN | cut -d'/' -f2)"
-          echo "METADATA_URL=$METADATA_URL" >> $GITHUB_OUTPUT
 
-      # ---------- STEP 4: Configure Cognito (back to TEAM account) ----------
+          INSTANCE_ID="${INSTANCE_ARN##*/}"
+          METADATA_URL="https://portal.sso.${{ vars.AWS_REGION }}.amazonaws.com/saml/metadata/${INSTANCE_ID}"
+          echo "METADATA_URL=$METADATA_URL" >> "$GITHUB_OUTPUT"
+
+      # Step 4: Cognito setup in TEAM account (Role B)
       - name: Switch back to TEAM account (Role B)
         uses: aws-actions/configure-aws-credentials@v4
         with:
@@ -161,23 +188,26 @@ jobs:
           aws-region: ${{ vars.AWS_REGION }}
 
       - name: Run cognito.sh
+        shell: bash
         run: |
-          cd deployment
-          echo '{"MetadataURL": "${{ steps.saml_app.outputs.METADATA_URL }}"}' > details.json
-          chmod +x cognito.sh
-          ./cognito.sh
+          echo "{\"MetadataURL\":\"${{ steps.saml_app.outputs.METADATA_URL }}\"}" > deployment/details.json
+          chmod +x deployment/cognito.sh
+          ./deployment/cognito.sh
 
-      - name: (Optional) Setup machine authentication
+      - name: Optional setup machine authentication
+        shell: bash
         run: |
-          cd deployment
-          chmod +x api-machine-auth.sh
-          ./api-machine-auth.sh || echo "Machine auth setup skipped."
+          chmod +x deployment/api-machine-auth.sh
+          ./deployment/api-machine-auth.sh || echo "Machine auth setup skipped."
 
       - name: Verify deployment
+        shell: bash
         run: |
-          APP_URL=$(aws amplify list-apps --query "apps[?name=='TEAM-IDC-APP'].defaultDomain" --output text)
-          if [ -n "$APP_URL" ]; then
-            curl -f "https://$APP_URL" && echo "TEAM application is online."
+          APP_URL="$(aws amplify list-apps --query "apps[?name=='TEAM-IDC-APP'].defaultDomain | [0]" --output text)"
+          if [ -n "$APP_URL" ] && [ "$APP_URL" != "None" ]; then
+            curl -fsS "https://${APP_URL}"
+            echo "TEAM application is online."
           else
             echo "Could not determine app URL."
+            exit 1
           fi
