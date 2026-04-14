@@ -131,6 +131,15 @@ jobs:
             done
           fi
 
+      - name: Debug CloudFormation stack
+        run: |
+          aws cloudformation describe-stacks --stack-name TEAM-IDC-APP --region ${{ vars.AWS_REGION }} || echo "Stack does not exist"
+          aws cloudformation list-stacks --region ${{ vars.AWS_REGION }} --query "StackSummaries[?contains(StackName, 'TEAM-IDC-APP')].[StackName, StackStatus]" --output table
+
+      - name: Debug stack outputs
+        run: |
+          aws cloudformation describe-stacks --stack-name TEAM-IDC-APP --region ${{ vars.AWS_REGION }} --query "Stacks[0].Outputs" --output table
+
       # ---------- STEP 3: Retrieve SAML parameters directly (replaces integration.sh) ----------
 
       - name: Retrieve SAML parameters from CloudFormation
