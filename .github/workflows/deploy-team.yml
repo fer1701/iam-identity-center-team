@@ -192,6 +192,7 @@ jobs:
      
 
       # ---------- STEP 4: Create SAML app in management account ----------
+      
       - name: Switch to management account (Role A) for SAML app
         uses: aws-actions/configure-aws-credentials@v4
         with:
@@ -221,16 +222,22 @@ jobs:
           fi
           METADATA_URL="https://portal.sso.${{ vars.AWS_REGION }}.amazonaws.com/saml/metadata/$(echo $INSTANCE_ARN | cut -d'/' -f2)"
           echo "METADATA_URL=$METADATA_URL" >> $GITHUB_OUTPUT
-          echo "APP_ARN=$APP_ARN" >> $GITHUB_OUTPUT
-      
-      
 
-      # ---------- STEP 5: Configure Cognito (back to TEAM account) ----------
-      - name: Switch back to TEAM account (Role B) for Cognito configuration
-        uses: aws-actions/configure-aws-credentials@v4
-        with:
-          role-to-assume: ${{ vars.TEAM_ROLE_B_ARN }}
-          aws-region: ${{ vars.AWS_REGION }}
+      # ---------- STEP 5: Assume Role B again (TEAM account) for Cognito configuration ----------
+      - name: Assume Role B again for Cognito configuration
+        run: |
+          CREDS=$(aws sts assume-role \
+            --role-arn "${{ vars.TEAM_ROLE_B_ARN }}" \
+            --role-session-name "GitHubActionsRoleB" \
+            --duration-seconds 3600 \
+            --output json)
+          echo "AWS_ACCESS_KEY_ID=$(echo $CREDS | jq -r .Credentials.AccessKeyId)" >> $GITHUB_ENV
+          echo "AWS_SECRET_ACCESS_KEY=$(echo $CREDS | jq -r .Credentials.SecretAccessKey)" >> $GITHUB_ENV
+          echo "AWS_SESSION_TOKEN=$(echo $CREDS | jq -r .Credentials.SessionToken)" >> $GITHUB_ENV
+          echo "AWS_REGION=${{ vars.AWS_REGION }}" >> $GITHUB_ENV
+          echo "AWS_DEFAULT_REGION=${{ vars.AWS_REGION }}" >> $GITHUB_ENV
+          echo "Successfully assumed Role B again"
+          aws sts get-caller-identity
 
       - name: Configure Cognito Identity Provider (SAML)
         run: |
