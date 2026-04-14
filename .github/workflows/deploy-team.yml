@@ -79,22 +79,39 @@ jobs:
         run: |
           aws codecommit delete-repository --repository-name team-idc-app --region ${{ vars.AWS_REGION }} || echo "Repository not found, continuing."
 
+      - name: Create CodeCommit repository
+        run: |
+          aws codecommit create-repository --repository-name team-idc-app --region ${{ vars.AWS_REGION }} --repository-description "Temporary Elevated Access Management (TEAM) Application"
+
+      - name: Create fresh git repository and push to CodeCommit
+        run: |
+          # Remove any existing .git (including any corruption)
+          rm -rf .git
+          git init -b main
+          git config user.email "github-actions@github.com"
+          git config user.name "GitHub Actions"
+          git add .
+          git commit -m "Initial commit for TEAM deployment"
+          git remote add origin codecommit::${{ vars.AWS_REGION }}://team-idc-app
+          git push --force origin main
+
       - name: Delete existing CloudFormation stack if in failed state
         run: |
           aws cloudformation delete-stack --stack-name TEAM-IDC-APP --region ${{ vars.AWS_REGION }} || echo "Stack does not exist or already deleted"
           aws cloudformation wait stack-delete-complete --stack-name TEAM-IDC-APP --region ${{ vars.AWS_REGION }} || echo "No stack to wait for"
 
-      - name: Patch deploy.sh
+      - name: Patch deploy.sh to skip git commands and only deploy CloudFormation
         run: |
           cd deployment
           # Unset AWS_PROFILE
           sed -i 's/^[[:space:]]*export[[:space:]]\+AWS_PROFILE=.*/unset AWS_PROFILE/' deploy.sh
-          # Force push
-          sed -i 's/git push origin main/git push --force origin main/' deploy.sh
-          # Make remote remove ignore errors
-          sed -i 's/git remote remove origin/git remote remove origin || true/' deploy.sh
+          # Comment out all lines that do git or create-repository
+          sed -i '/aws codecommit create-repository/ s/^/#/' deploy.sh
+          sed -i '/git remote remove origin/ s/^/#/' deploy.sh
+          sed -i '/git remote add origin/ s/^/#/' deploy.sh
+          sed -i '/git push origin main/ s/^/#/' deploy.sh
 
-      - name: Run deploy.sh
+      - name: Run deploy.sh (only CloudFormation deployment)
         run: |
           cd deployment
           chmod +x deploy.sh
