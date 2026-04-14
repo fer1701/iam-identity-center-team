@@ -204,6 +204,7 @@ jobs:
         run: |
           INSTANCE_ARN=$(aws sso-admin list-instances --region ${{ vars.AWS_REGION }} --query "Instances[0].InstanceArn" --output text)
           APP_ARN=$(aws sso-admin list-applications --region ${{ vars.AWS_REGION }} --instance-arn "$INSTANCE_ARN" --query "Applications[?Name=='TEAM-IDC-APP'].ApplicationArn" --output text)
+          START_URL="${{ steps.saml.outputs.START_URL }}"
           if [ -z "$APP_ARN" ]; then
             echo "Creating new SAML application..."
             APP_ARN=$(aws sso-admin create-application \
@@ -211,13 +212,13 @@ jobs:
               --description "TEAM Temporary Elevated Access Management" \
               --application-provider-arn "arn:aws:sso::aws:applicationProvider/custom" \
               --instance-arn "$INSTANCE_ARN" \
-              --portal-options '{"SignInOptions": {"SignInUrl": "${{ steps.saml.outputs.START_URL }}"}}' \
+              --portal-options "{\"SignInOptions\": {\"Origin\": \"${START_URL}\", \"ApplicationUrl\": \"${START_URL}\"}}" \
               --query "ApplicationArn" --output text)
           else
             echo "Updating existing SAML application: $APP_ARN"
             aws sso-admin update-application \
               --application-arn "$APP_ARN" \
-              --portal-options '{"SignInOptions": {"SignInUrl": "${{ steps.saml.outputs.START_URL }}"}}'
+              --portal-options "{\"SignInOptions\": {\"Origin\": \"${START_URL}\", \"ApplicationUrl\": \"${START_URL}\"}}"
           fi
           METADATA_URL="https://portal.sso.${{ vars.AWS_REGION }}.amazonaws.com/saml/metadata/$(echo $INSTANCE_ARN | cut -d'/' -f2)"
           echo "METADATA_URL=$METADATA_URL" >> $GITHUB_OUTPUT
