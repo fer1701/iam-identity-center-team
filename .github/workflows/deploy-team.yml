@@ -193,62 +193,99 @@ jobs:
 
       # ---------- STEP 4: Create SAML app in management account ----------
       
+
+      # ---------- STEP 4: Create/Update SAML app in management account ----------
       - name: Switch to management account (Role A) for SAML app
         uses: aws-actions/configure-aws-credentials@v4
         with:
           role-to-assume: arn:aws:iam::${{ vars.MANAGEMENT_ACCOUNT }}:role/GitHubActions-TEAM-RoleA
           aws-region: ${{ vars.AWS_REGION }}
 
-      - name: Create or update SAML 2.0 application with correct SAML metadata
+      - name: Create or update SAML 2.0 application (fully automated)
         id: saml_app
         run: |
-          INSTANCE_ARN=$(aws sso-admin list-instances --region ${{ vars.AWS_REGION }} --query "Instances[0].InstanceArn" --output text)
-          APP_ARN=$(aws sso-admin list-applications --region ${{ vars.AWS_REGION }} --instance-arn "$INSTANCE_ARN" --query "Applications[?Name=='TEAM-IDC-APP'].ApplicationArn" --output text)
           START_URL="${{ steps.saml.outputs.START_URL }}"
           ACS_URL="${{ steps.saml.outputs.ACS_URL }}"
           AUDIENCE="${{ steps.saml.outputs.AUDIENCE }}"
-          
-          # Create the SAML metadata XML document for Cognito as SP
-          cat > saml-metadata.xml <<EOF
-          <EntityDescriptor entityID="${AUDIENCE}" xmlns="urn:oasis:names:tc:SAML:2.0:metadata">
-            <SPSSODescriptor AuthnRequestsSigned="false" WantAssertionsSigned="true" protocolSupportEnumeration="urn:oasis:names:tc:SAML:2.0:protocol">
-              <AssertionConsumerService index="0" isDefault="true" Binding="urn:oasis:names:tc:SAML:2.0:bindings:HTTP-POST" Location="${ACS_URL}"/>
-            </SPSSODescriptor>
-          </EntityDescriptor>
-          EOF
-          
-          if [ -z "$APP_ARN" ]; then
+          APP_NAME="TEAM-IDC-APP"
+          INSTANCE_ARN=$(aws sso-admin list-instances --region ${{ vars.AWS_REGION }} --query 'Instances[0].InstanceArn' --output text)
+
+          # 1. Get or create application
+          APP_ARN=$(aws sso-admin list-applications --instance-arn $INSTANCE_ARN --region ${{ vars.AWS_REGION }} \
+            --query "Applications[?Name=='$APP_NAME'].ApplicationArn" --output text)
+
+          if [ -z "$APP_ARN" ] || [ "$APP_ARN" == "None" ]; then
             echo "Creating new SAML application..."
             APP_ARN=$(aws sso-admin create-application \
-              --name "TEAM-IDC-APP" \
+              --instance-arn $INSTANCE_ARN \
+              --application-provider-arn "arn:aws:sso::aws:applicationProvider/custom-saml" \
+              --name "$APP_NAME" \
               --description "TEAM Temporary Elevated Access Management" \
-              --application-provider-arn "arn:aws:sso::aws:applicationProvider/custom" \
-              --instance-arn "$INSTANCE_ARN" \
-              --portal-options "{\"SignInOptions\": {\"Origin\": \"APPLICATION\", \"ApplicationUrl\": \"${START_URL}\"}}" \
-              --query "ApplicationArn" --output text)
-            # Wait for creation to propagate
-            sleep 5
-            # Update the application with the SAML metadata
-            aws sso-admin update-application \
-              --application-arn "$APP_ARN" \
-              --saml-metadata-document file://saml-metadata.xml
+              --portal-options "{\"SignInOptions\": {\"Origin\": \"APPLICATION\", \"ApplicationUrl\": \"$START_URL\"}, \"Visibility\": \"VISIBLE\"}" \
+              --query 'ApplicationArn' --output text)
           else
-            echo "Updating existing SAML application: $APP_ARN"
+            echo "Application exists, updating portal options..."
             aws sso-admin update-application \
-              --application-arn "$APP_ARN" \
-              --portal-options "{\"SignInOptions\": {\"Origin\": \"APPLICATION\", \"ApplicationUrl\": \"${START_URL}\"}}"
-            aws sso-admin update-application \
-              --application-arn "$APP_ARN" \
-              --saml-metadata-document file://saml-metadata.xml
+              --application-arn $APP_ARN \
+              --portal-options "{\"SignInOptions\": {\"Origin\": \"APPLICATION\", \"ApplicationUrl\": \"$START_URL\"}}"
           fi
-          
-          # Now retrieve the metadata URL from the application (after update)
-          # The metadata URL is not directly returned, but we can construct it from the application ID
-          APP_ID_FROM_ARN=$(echo $APP_ARN | cut -d'/' -f3)
-          METADATA_URL="https://portal.sso.${{ vars.AWS_REGION }}.amazonaws.com/saml/metadata/${APP_ID_FROM_ARN}"
-          echo "METADATA_URL=$METADATA_URL" >> $GITHUB_OUTPUT 
-      
-      # ---------- STEP 5: Assume Role B again (TEAM account) for Cognito configuration ----------
+
+          # 2. Configure SAML authentication method (ACS URL and Audience)
+          aws sso-admin put-application-authentication-method \
+            --application-arn $APP_ARN \
+            --authentication-method-type "SAML" \
+            --authentication-method "{
+              \"Saml\": {
+                \"InstanceMetadata\": {
+                  \"AuthenticationSymmetricAlgorithm\": \"AES128\",
+                  \"ReplyUrls\": {
+                    \"AssertionConsumerServiceUrls\": [\"$ACS_URL\"]
+                  },
+                  \"Audience\": \"$AUDIENCE\"
+                }
+              }
+            }"
+
+          # 3. Configure attribute mappings (Subject and Email)
+          aws sso-admin put-application-assignment-configuration \
+            --application-arn $APP_ARN \
+            --assignment-configuration "{
+              \"Attributes\": [
+                {
+                  \"Value\": \"\${user:subject}\",
+                  \"Configuration\": {
+                    \"Saml\": {
+                      \"AttributeName\": \"Subject\",
+                      \"Format\": \"urn:oasis:names:tc:SAML:2.0:nameid-format:persistent\"
+                    }
+                  }
+                },
+                {
+                  \"Value\": \"\${user:email}\",
+                  \"Configuration\": {
+                    \"Saml\": {
+                      \"AttributeName\": \"email\",
+                      \"Format\": \"urn:oasis:names:tc:SAML:2.0:attrname-format:basic\"
+                    }
+                  }
+                }
+              ]
+            }"
+
+          # 4. Retrieve the SAML metadata URL
+          METADATA_URL=$(aws sso-admin get-application \
+            --application-arn $APP_ARN \
+            --query 'Application.InstanceMetadata.SsoSamlMetadataUrl' --output text)
+
+          if [ -z "$METADATA_URL" ]; then
+            echo "ERROR: Could not retrieve metadata URL"
+            exit 1
+          fi
+
+          echo "METADATA_URL=$METADATA_URL" >> $GITHUB_OUTPUT
+          echo "APP_ARN=$APP_ARN" >> $GITHUB_OUTPUT
+
+      # ---------- STEP 5: Assume Role B again for Cognito configuration ----------
       - name: Assume Role B again for Cognito configuration
         run: |
           CREDS=$(aws sts assume-role \
@@ -266,27 +303,49 @@ jobs:
 
       - name: Configure Cognito Identity Provider (SAML)
         run: |
-          # Create the SAML identity provider in Cognito
-          echo '{"MetadataURL": "${{ steps.saml_app.outputs.METADATA_URL }}"}' > details.json
-          aws cognito-idp create-identity-provider \
-            --user-pool-id ${{ steps.saml.outputs.USER_POOL_ID }} \
-            --provider-name IDC \
-            --provider-type SAML \
-            --provider-details file://details.json \
-            --attribute-mapping email=Email \
-            --idp-identifiers team || echo "Provider may already exist, updating..."
-          # Update the user pool client to use the new provider
+          # Create or update the SAML identity provider in Cognito
+          PROVIDER_NAME="IAMIdentityCenter"
+          USER_POOL_ID="${{ steps.saml.outputs.USER_POOL_ID }}"
+          METADATA_URL="${{ steps.saml_app.outputs.METADATA_URL }}"
+
+          # Check if provider exists
+          EXISTS=$(aws cognito-idp list-identity-providers \
+            --user-pool-id "$USER_POOL_ID" \
+            --query "Providers[?ProviderName=='$PROVIDER_NAME'] | length(@)" \
+            --output text || echo "0")
+
+          if [ "$EXISTS" = "0" ]; then
+            echo "Creating Cognito SAML provider..."
+            aws cognito-idp create-identity-provider \
+              --user-pool-id "$USER_POOL_ID" \
+              --provider-name "$PROVIDER_NAME" \
+              --provider-type SAML \
+              --provider-details "MetadataURL=$METADATA_URL" \
+              --attribute-mapping "email=email" \
+              --idp-identifiers team
+          else
+            echo "Updating Cognito SAML provider..."
+            aws cognito-idp update-identity-provider \
+              --user-pool-id "$USER_POOL_ID" \
+              --provider-name "$PROVIDER_NAME" \
+              --provider-details "MetadataURL=$METADATA_URL" \
+              --attribute-mapping "email=email"
+          fi
+
+          # Update the user pool client to use this provider
+          CLIENT_ID="${{ steps.saml.outputs.CLIENT_ID }}"
+          AMPLIFY_DOMAIN="${{ steps.saml.outputs.AMPLIFY_DOMAIN }}"
           aws cognito-idp update-user-pool-client \
-            --user-pool-id ${{ steps.saml.outputs.USER_POOL_ID }} \
-            --client-id ${{ steps.saml.outputs.CLIENT_ID }} \
+            --user-pool-id "$USER_POOL_ID" \
+            --client-id "$CLIENT_ID" \
             --refresh-token-validity 1 \
-            --supported-identity-providers IDC \
+            --supported-identity-providers "$PROVIDER_NAME" \
             --allowed-o-auth-flows code \
             --allowed-o-auth-scopes "phone" "email" "openid" "profile" "aws.cognito.signin.user.admin" \
-            --logout-urls "https://${{ steps.saml.outputs.AMPLIFY_DOMAIN }}/" \
-            --callback-urls "https://${{ steps.saml.outputs.AMPLIFY_DOMAIN }}/" \
+            --logout-urls "https://main.${AMPLIFY_DOMAIN}/" \
+            --callback-urls "https://main.${AMPLIFY_DOMAIN}/" \
             --allowed-o-auth-flows-user-pool-client
-
+     
       - name: (Optional) Setup machine authentication
         run: |
           cd deployment
