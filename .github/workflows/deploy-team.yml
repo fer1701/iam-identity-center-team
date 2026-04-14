@@ -132,23 +132,59 @@ jobs:
           fi
 
       # ---------- STEP 3: Retrieve SAML parameters directly (replaces integration.sh) ----------
+
       - name: Retrieve SAML parameters from CloudFormation
         id: saml
         run: |
           STACK_NAME="TEAM-IDC-APP"
+          # Wait for stack to be fully created (if still in progress)
+          aws cloudformation wait stack-create-complete --stack-name $STACK_NAME --region ${{ vars.AWS_REGION }} || true
+          
+          # Get User Pool ID from stack outputs
           USER_POOL_ID=$(aws cloudformation describe-stacks --stack-name $STACK_NAME --query "Stacks[0].Outputs[?OutputKey=='UserPoolId'].OutputValue" --output text)
-          APP_ID=$(aws cloudformation describe-stacks --stack-name $STACK_NAME --query "Stacks[0].Outputs[?OutputKey=='AppId'].OutputValue" --output text)
-          COGNITO_DOMAIN="${USER_POOL_ID}.auth.${{ vars.AWS_REGION }}.amazoncognito.com"
+          if [ -z "$USER_POOL_ID" ]; then
+            echo "UserPoolId not found in stack outputs, falling back to listing user pools by name..."
+            USER_POOL_ID=$(aws cognito-idp list-user-pools --max-results 10 --region ${{ vars.AWS_REGION }} --query "UserPools[?contains(Name, 'TEAM-IDC-APP')].Id" --output text | head -1)
+          fi
+          if [ -z "$USER_POOL_ID" ]; then
+            echo "ERROR: Could not retrieve User Pool ID"
+            exit 1
+          fi
+          echo "USER_POOL_ID=$USER_POOL_ID" >> $GITHUB_OUTPUT
 
-          # Get the Cognito app client ID (standard client name is 'team-app-client')
+          # Get App ID from stack outputs
+          APP_ID=$(aws cloudformation describe-stacks --stack-name $STACK_NAME --query "Stacks[0].Outputs[?OutputKey=='AppId'].OutputValue" --output text)
+          if [ -z "$APP_ID" ]; then
+            echo "AppId not found in stack outputs, falling back to listing Amplify apps by name..."
+            APP_ID=$(aws amplify list-apps --region ${{ vars.AWS_REGION }} --query "apps[?name=='TEAM-IDC-APP'].appId" --output text)
+          fi
+          if [ -z "$APP_ID" ]; then
+            echo "ERROR: Could not retrieve App ID"
+            exit 1
+          fi
+          echo "APP_ID=$APP_ID" >> $GITHUB_OUTPUT
+
+          # Get Cognito client ID
           CLIENT_ID=$(aws cognito-idp list-user-pool-clients --user-pool-id $USER_POOL_ID --query "UserPoolClients[?ClientName=='team-app-client'].ClientId" --output text)
           if [ -z "$CLIENT_ID" ]; then
-            # Fallback to first client
             CLIENT_ID=$(aws cognito-idp list-user-pool-clients --user-pool-id $USER_POOL_ID --query "UserPoolClients[0].ClientId" --output text)
           fi
+          if [ -z "$CLIENT_ID" ]; then
+            echo "ERROR: Could not retrieve Cognito client ID"
+            exit 1
+          fi
+          echo "CLIENT_ID=$CLIENT_ID" >> $GITHUB_OUTPUT
 
           # Get Amplify domain
           AMPLIFY_DOMAIN=$(aws amplify get-app --app-id $APP_ID --query "app.defaultDomain" --output text)
+          if [ -z "$AMPLIFY_DOMAIN" ]; then
+            echo "ERROR: Could not retrieve Amplify domain"
+            exit 1
+          fi
+          echo "AMPLIFY_DOMAIN=$AMPLIFY_DOMAIN" >> $GITHUB_OUTPUT
+
+          # Build SAML URLs
+          COGNITO_DOMAIN="${USER_POOL_ID}.auth.${{ vars.AWS_REGION }}.amazoncognito.com"
           REDIRECT_URI="https://main.${AMPLIFY_DOMAIN}/"
 
           START_URL="https://${COGNITO_DOMAIN}/authorize?client_id=${CLIENT_ID}&response_type=code&scope=aws.cognito.signin.user.admin+email+openid+phone+profile&redirect_uri=${REDIRECT_URI}&idp_identifier=team"
@@ -158,9 +194,7 @@ jobs:
           echo "START_URL=$START_URL" >> $GITHUB_OUTPUT
           echo "ACS_URL=$ACS_URL" >> $GITHUB_OUTPUT
           echo "AUDIENCE=$AUDIENCE" >> $GITHUB_OUTPUT
-          echo "USER_POOL_ID=$USER_POOL_ID" >> $GITHUB_OUTPUT
-          echo "CLIENT_ID=$CLIENT_ID" >> $GITHUB_OUTPUT
-          echo "AMPLIFY_DOMAIN=$AMPLIFY_DOMAIN" >> $GITHUB_OUTPUT
+     
 
       # ---------- STEP 4: Create SAML app in management account ----------
       - name: Switch to management account (Role A) for SAML app
