@@ -199,7 +199,7 @@ jobs:
           role-to-assume: arn:aws:iam::${{ vars.MANAGEMENT_ACCOUNT }}:role/GitHubActions-TEAM-RoleA
           aws-region: ${{ vars.AWS_REGION }}
 
-      - name: Create or update SAML 2.0 application
+      - name: Create or update SAML 2.0 application and get metadata URL
         id: saml_app
         run: |
           INSTANCE_ARN=$(aws sso-admin list-instances --region ${{ vars.AWS_REGION }} --query "Instances[0].InstanceArn" --output text)
@@ -220,9 +220,13 @@ jobs:
               --application-arn "$APP_ARN" \
               --portal-options "{\"SignInOptions\": {\"Origin\": \"APPLICATION\", \"ApplicationUrl\": \"${START_URL}\"}}"
           fi
-          # Extract application ID from ARN (format: arn:aws:sso:::application/instanceId/appId)
-          APP_ID_FROM_ARN=$(echo $APP_ARN | cut -d'/' -f3)
-          METADATA_URL="https://portal.sso.${{ vars.AWS_REGION }}.amazonaws.com/saml/metadata/${APP_ID_FROM_ARN}"
+          echo "APP_ARN=$APP_ARN" >> $GITHUB_OUTPUT
+          # Get the application's metadata URL directly from the application details
+          METADATA_URL=$(aws sso-admin get-application --application-arn $APP_ARN --query "ApplicationMetadata" --output text)
+          if [ -z "$METADATA_URL" ]; then
+            echo "ERROR: Could not retrieve metadata URL from application"
+            exit 1
+          fi
           echo "METADATA_URL=$METADATA_URL" >> $GITHUB_OUTPUT
       
       # ---------- STEP 5: Assume Role B again (TEAM account) for Cognito configuration ----------
