@@ -117,16 +117,32 @@ jobs:
       - name: Wait for Amplify deployment
         run: |
           APP_ID=$(aws cloudformation describe-stacks --stack-name TEAM-IDC-APP --query "Stacks[0].Outputs[?OutputKey=='AppId'].OutputValue" --output text)
-          if [ -n "$APP_ID" ]; then
-            echo "Amplify App ID: $APP_ID"
-            while true; do
-              STATUS=$(aws amplify get-app --app-id $APP_ID --query "app.status" --output text)
-              echo "Amplify status: $STATUS"
-              if [ "$STATUS" = "AVAILABLE" ]; then break; fi
-              if [ "$STATUS" = "FAILED" ]; then exit 1; fi
-              sleep 30
-            done
+          if [ -z "$APP_ID" ]; then
+            echo "ERROR: Could not retrieve AppId from stack outputs"
+            exit 1
           fi
+          echo "Amplify App ID: $APP_ID"
+          while true; do
+            STATUS=$(aws amplify get-app --app-id $APP_ID --query "app.status" --output text 2>/dev/null || echo "UNKNOWN")
+            echo "Amplify status: $STATUS"
+            case "$STATUS" in
+              AVAILABLE)
+                echo "Amplify deployment successful."
+                break
+                ;;
+              FAILED)
+                echo "Amplify build failed. Check Amplify console for details."
+                exit 1
+                ;;
+              UNKNOWN)
+                echo "Could not get app status; retrying in 30 seconds..."
+                ;;
+              *)
+                echo "Status: $STATUS, waiting..."
+                ;;
+            esac
+            sleep 30
+          done
 
       # ---------- STEP 3: Retrieve Cognito and Amplify details ----------
 
