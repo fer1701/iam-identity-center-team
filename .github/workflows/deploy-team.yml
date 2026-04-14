@@ -129,9 +129,21 @@ jobs:
           fi
 
       # ---------- STEP 3: Retrieve Cognito and Amplify details ----------
+
       - name: Retrieve SAML parameters from CloudFormation
         id: saml
         run: |
+          # Wait for the stack to be fully created (already done, but double-check)
+          echo "Waiting for TEAM-IDC-APP stack to be CREATE_COMPLETE..."
+          while true; do
+            STATUS=$(aws cloudformation describe-stacks --stack-name TEAM-IDC-APP --region ${{ vars.AWS_REGION }} --query "Stacks[0].StackStatus" --output text 2>/dev/null)
+            if [ "$STATUS" = "CREATE_COMPLETE" ]; then
+              break
+            fi
+            echo "Stack status: $STATUS, waiting 10 seconds..."
+            sleep 10
+          done
+      
           # Get Amplify App ID by name
           APP_ID=$(aws amplify list-apps --region ${{ vars.AWS_REGION }} --query "apps[?name=='TEAM-IDC-APP'].appId" --output text)
           if [ -z "$APP_ID" ]; then
@@ -139,28 +151,30 @@ jobs:
             exit 1
           fi
           echo "APP_ID=$APP_ID" >> $GITHUB_OUTPUT
-
+      
           # Get Amplify domain
           AMPLIFY_DOMAIN=$(aws amplify get-app --app-id $APP_ID --query "app.defaultDomain" --output text)
           echo "AMPLIFY_DOMAIN=$AMPLIFY_DOMAIN" >> $GITHUB_OUTPUT
-
-          # Get Cognito User Pool ID by name pattern (from the TEAM script)
-          USER_POOL_ID=$(aws cognito-idp list-user-pools --max-results 20 --region ${{ vars.AWS_REGION }} --query "UserPools[?contains(Name, 'team06dbb7fc')].Id" --output text)
-          if [ -z "$USER_POOL_ID" ]; then
-            USER_POOL_ID=$(aws cognito-idp list-user-pools --max-results 1 --region ${{ vars.AWS_REGION }} --query "UserPools[0].Id" --output text)
-          fi
-          if [ -z "$USER_POOL_ID" ]; then
-            echo "ERROR: Could not retrieve Cognito User Pool ID"
-            exit 1
-          fi
+      
+          # Wait for the Cognito user pool to exist (it may take a minute after stack creation)
+          echo "Waiting for Cognito user pool to be created..."
+          USER_POOL_ID=""
+          while [ -z "$USER_POOL_ID" ]; do
+            USER_POOL_ID=$(aws cognito-idp list-user-pools --max-results 20 --region ${{ vars.AWS_REGION }} --query "UserPools[?contains(Name, 'team06dbb7fc')].Id" --output text)
+            if [ -z "$USER_POOL_ID" ]; then
+              echo "User pool not yet found, waiting 10 seconds..."
+              sleep 10
+            fi
+          done
           echo "USER_POOL_ID=$USER_POOL_ID" >> $GITHUB_OUTPUT
-
+      
           # Get Cognito client ID (web client)
           CLIENT_ID=$(aws cognito-idp list-user-pool-clients --user-pool-id $USER_POOL_ID --query "UserPoolClients[?contains(ClientName, 'clientWeb')].ClientId" --output text | head -1)
           if [ -z "$CLIENT_ID" ]; then
             CLIENT_ID=$(aws cognito-idp list-user-pool-clients --user-pool-id $USER_POOL_ID --query "UserPoolClients[0].ClientId" --output text)
           fi
           echo "CLIENT_ID=$CLIENT_ID" >> $GITHUB_OUTPUT
+
 
       # ---------- STEP 4: Configure Cognito using pre‑stored SAML metadata URL ----------
       - name: Configure Cognito Identity Provider (SAML)
