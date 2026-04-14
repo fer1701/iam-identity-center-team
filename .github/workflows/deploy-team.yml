@@ -114,35 +114,63 @@ jobs:
           chmod +x deploy.sh
           ./deploy.sh
 
-      - name: Wait for Amplify deployment
+      - name: Wait for Amplify and retrieve SAML parameters
+        id: saml
         run: |
-          APP_ID=$(aws cloudformation describe-stacks --stack-name TEAM-IDC-APP --query "Stacks[0].Outputs[?OutputKey=='AppId'].OutputValue" --output text)
-          if [ -z "$APP_ID" ]; then
-            echo "ERROR: Could not retrieve AppId from stack outputs"
-            exit 1
-          fi
-          echo "Amplify App ID: $APP_ID"
+          # Wait for Amplify app to exist
+          echo "Waiting for Amplify app TEAM-IDC-APP to be created..."
+          APP_ID=""
+          while [ -z "$APP_ID" ]; do
+            APP_ID=$(aws amplify list-apps --region ${{ vars.AWS_REGION }} --query "apps[?name=='TEAM-IDC-APP'].appId" --output text)
+            if [ -z "$APP_ID" ]; then
+              echo "Amplify app not yet found, waiting 10 seconds..."
+              sleep 10
+            fi
+          done
+          echo "APP_ID=$APP_ID" >> $GITHUB_OUTPUT
+      
+          # Wait for Amplify build to complete (status AVAILABLE)
           while true; do
             STATUS=$(aws amplify get-app --app-id $APP_ID --query "app.status" --output text 2>/dev/null || echo "UNKNOWN")
             echo "Amplify status: $STATUS"
-            case "$STATUS" in
-              AVAILABLE)
-                echo "Amplify deployment successful."
-                break
-                ;;
-              FAILED)
-                echo "Amplify build failed. Check Amplify console for details."
-                exit 1
-                ;;
-              UNKNOWN)
-                echo "Could not get app status; retrying in 30 seconds..."
-                ;;
-              *)
-                echo "Status: $STATUS, waiting..."
-                ;;
-            esac
+            if [ "$STATUS" = "AVAILABLE" ]; then
+              break
+            elif [ "$STATUS" = "FAILED" ]; then
+              echo "Amplify build failed. Check Amplify console."
+              exit 1
+            fi
             sleep 30
           done
+      
+          # Get Amplify domain
+          AMPLIFY_DOMAIN=$(aws amplify get-app --app-id $APP_ID --query "app.defaultDomain" --output text)
+          echo "AMPLIFY_DOMAIN=$AMPLIFY_DOMAIN" >> $GITHUB_OUTPUT
+      
+          # Wait for Cognito user pool to exist
+          echo "Waiting for Cognito user pool..."
+          USER_POOL_ID=""
+          while [ -z "$USER_POOL_ID" ]; do
+            USER_POOL_ID=$(aws cognito-idp list-user-pools --max-results 20 --region ${{ vars.AWS_REGION }} --query "UserPools[?contains(Name, 'team06dbb7fc')].Id" --output text)
+            if [ -z "$USER_POOL_ID" ]; then
+              echo "User pool not yet found, waiting 10 seconds..."
+              sleep 10
+            fi
+          done
+          echo "USER_POOL_ID=$USER_POOL_ID" >> $GITHUB_OUTPUT
+      
+          # Wait for Cognito client ID (web client)
+          CLIENT_ID=""
+          while [ -z "$CLIENT_ID" ]; do
+            CLIENT_ID=$(aws cognito-idp list-user-pool-clients --user-pool-id $USER_POOL_ID --query "UserPoolClients[?contains(ClientName, 'clientWeb')].ClientId" --output text | head -1)
+            if [ -z "$CLIENT_ID" ]; then
+              CLIENT_ID=$(aws cognito-idp list-user-pool-clients --user-pool-id $USER_POOL_ID --query "UserPoolClients[0].ClientId" --output text)
+            fi
+            if [ -z "$CLIENT_ID" ]; then
+              echo "Client ID not yet found, waiting 10 seconds..."
+              sleep 10
+            fi
+          done
+          echo "CLIENT_ID=$CLIENT_ID" >> $GITHUB_OUTPUT
 
       # ---------- STEP 3: Retrieve Cognito and Amplify details ----------
 
@@ -197,34 +225,19 @@ jobs:
         run: |
           PROVIDER_NAME="IAMIdentityCenter"
           USER_POOL_ID="${{ steps.saml.outputs.USER_POOL_ID }}"
-          METADATA_URL="${{ vars.SAML_METADATA_URL }}"
           CLIENT_ID="${{ steps.saml.outputs.CLIENT_ID }}"
+          METADATA_URL="${{ vars.SAML_METADATA_URL }}"   # or from SAML app creation step
           AMPLIFY_DOMAIN="${{ steps.saml.outputs.AMPLIFY_DOMAIN }}"
-
-          # Check if provider exists
-          EXISTS=$(aws cognito-idp list-identity-providers \
+      
+          # Create or update identity provider
+          aws cognito-idp create-identity-provider \
             --user-pool-id "$USER_POOL_ID" \
-            --query "Providers[?ProviderName=='$PROVIDER_NAME'] | length(@)" \
-            --output text || echo "0")
-
-          if [ "$EXISTS" = "0" ]; then
-            echo "Creating Cognito SAML provider..."
-            aws cognito-idp create-identity-provider \
-              --user-pool-id "$USER_POOL_ID" \
-              --provider-name "$PROVIDER_NAME" \
-              --provider-type SAML \
-              --provider-details "MetadataURL=$METADATA_URL" \
-              --attribute-mapping "email=email" \
-              --idp-identifiers team
-          else
-            echo "Updating Cognito SAML provider..."
-            aws cognito-idp update-identity-provider \
-              --user-pool-id "$USER_POOL_ID" \
-              --provider-name "$PROVIDER_NAME" \
-              --provider-details "MetadataURL=$METADATA_URL" \
-              --attribute-mapping "email=email"
-          fi
-
+            --provider-name "$PROVIDER_NAME" \
+            --provider-type SAML \
+            --provider-details "MetadataURL=$METADATA_URL" \
+            --attribute-mapping "email=email" \
+            --idp-identifiers team || true
+      
           # Update user pool client
           aws cognito-idp update-user-pool-client \
             --user-pool-id "$USER_POOL_ID" \
@@ -236,6 +249,7 @@ jobs:
             --logout-urls "https://main.${AMPLIFY_DOMAIN}/" \
             --callback-urls "https://main.${AMPLIFY_DOMAIN}/" \
             --allowed-o-auth-flows-user-pool-client
+
 
       - name: (Optional) Setup machine authentication
         run: |
