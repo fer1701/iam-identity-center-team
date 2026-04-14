@@ -142,55 +142,41 @@ jobs:
 
       # ---------- STEP 3: Retrieve SAML parameters directly (replaces integration.sh) ----------
 
+
       - name: Retrieve SAML parameters from CloudFormation
         id: saml
         run: |
-          STACK_NAME="TEAM-IDC-APP"
-          # Wait for stack to be fully created (if still in progress)
-          aws cloudformation wait stack-create-complete --stack-name $STACK_NAME --region ${{ vars.AWS_REGION }} || true
-          
-          # Get User Pool ID from stack outputs
-          USER_POOL_ID=$(aws cloudformation describe-stacks --stack-name $STACK_NAME --query "Stacks[0].Outputs[?OutputKey=='UserPoolId'].OutputValue" --output text)
-          if [ -z "$USER_POOL_ID" ]; then
-            echo "UserPoolId not found in stack outputs, falling back to listing user pools by name..."
-            USER_POOL_ID=$(aws cognito-idp list-user-pools --max-results 10 --region ${{ vars.AWS_REGION }} --query "UserPools[?contains(Name, 'TEAM-IDC-APP')].Id" --output text | head -1)
-          fi
-          if [ -z "$USER_POOL_ID" ]; then
-            echo "ERROR: Could not retrieve User Pool ID"
-            exit 1
-          fi
-          echo "USER_POOL_ID=$USER_POOL_ID" >> $GITHUB_OUTPUT
-
-          # Get App ID from stack outputs
-          APP_ID=$(aws cloudformation describe-stacks --stack-name $STACK_NAME --query "Stacks[0].Outputs[?OutputKey=='AppId'].OutputValue" --output text)
+          # Get Amplify App ID by name
+          APP_ID=$(aws amplify list-apps --region ${{ vars.AWS_REGION }} --query "apps[?name=='TEAM-IDC-APP'].appId" --output text)
           if [ -z "$APP_ID" ]; then
-            echo "AppId not found in stack outputs, falling back to listing Amplify apps by name..."
-            APP_ID=$(aws amplify list-apps --region ${{ vars.AWS_REGION }} --query "apps[?name=='TEAM-IDC-APP'].appId" --output text)
-          fi
-          if [ -z "$APP_ID" ]; then
-            echo "ERROR: Could not retrieve App ID"
+            echo "ERROR: Could not retrieve Amplify App ID"
             exit 1
           fi
           echo "APP_ID=$APP_ID" >> $GITHUB_OUTPUT
 
-          # Get Cognito client ID
-          CLIENT_ID=$(aws cognito-idp list-user-pool-clients --user-pool-id $USER_POOL_ID --query "UserPoolClients[?ClientName=='team-app-client'].ClientId" --output text)
-          if [ -z "$CLIENT_ID" ]; then
-            CLIENT_ID=$(aws cognito-idp list-user-pool-clients --user-pool-id $USER_POOL_ID --query "UserPoolClients[0].ClientId" --output text)
-          fi
-          if [ -z "$CLIENT_ID" ]; then
-            echo "ERROR: Could not retrieve Cognito client ID"
-            exit 1
-          fi
-          echo "CLIENT_ID=$CLIENT_ID" >> $GITHUB_OUTPUT
-
           # Get Amplify domain
           AMPLIFY_DOMAIN=$(aws amplify get-app --app-id $APP_ID --query "app.defaultDomain" --output text)
-          if [ -z "$AMPLIFY_DOMAIN" ]; then
-            echo "ERROR: Could not retrieve Amplify domain"
+          echo "AMPLIFY_DOMAIN=$AMPLIFY_DOMAIN" >> $GITHUB_OUTPUT
+
+          # Get Cognito User Pool ID by exact name pattern (from the original TEAM script)
+          USER_POOL_ID=$(aws cognito-idp list-user-pools --max-results 20 --region ${{ vars.AWS_REGION }} --query "UserPools[?contains(Name, 'team06dbb7fc')].Id" --output text)
+          if [ -z "$USER_POOL_ID" ]; then
+            # Fallback: get the first user pool (should not happen)
+            USER_POOL_ID=$(aws cognito-idp list-user-pools --max-results 1 --region ${{ vars.AWS_REGION }} --query "UserPools[0].Id" --output text)
+          fi
+          if [ -z "$USER_POOL_ID" ]; then
+            echo "ERROR: Could not retrieve Cognito User Pool ID"
             exit 1
           fi
-          echo "AMPLIFY_DOMAIN=$AMPLIFY_DOMAIN" >> $GITHUB_OUTPUT
+          echo "USER_POOL_ID=$USER_POOL_ID" >> $GITHUB_OUTPUT
+
+          # Get Cognito client ID (the one with name containing 'clientWeb' or 'team-app-client')
+          CLIENT_ID=$(aws cognito-idp list-user-pool-clients --user-pool-id $USER_POOL_ID --query "UserPoolClients[?contains(ClientName, 'clientWeb') || contains(ClientName, 'team-app-client')].ClientId" --output text | head -1)
+          if [ -z "$CLIENT_ID" ]; then
+            # Fallback to first client
+            CLIENT_ID=$(aws cognito-idp list-user-pool-clients --user-pool-id $USER_POOL_ID --query "UserPoolClients[0].ClientId" --output text)
+          fi
+          echo "CLIENT_ID=$CLIENT_ID" >> $GITHUB_OUTPUT
 
           # Build SAML URLs
           COGNITO_DOMAIN="${USER_POOL_ID}.auth.${{ vars.AWS_REGION }}.amazoncognito.com"
