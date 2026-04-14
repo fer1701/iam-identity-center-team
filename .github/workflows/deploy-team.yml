@@ -85,7 +85,6 @@ jobs:
 
       - name: Create fresh git repository and push to CodeCommit
         run: |
-          # Remove any existing .git (including any corruption)
           rm -rf .git
           git init -b main
           git config user.email "github-actions@github.com"
@@ -103,9 +102,7 @@ jobs:
       - name: Patch deploy.sh to skip git commands and only deploy CloudFormation
         run: |
           cd deployment
-          # Unset AWS_PROFILE
           sed -i 's/^[[:space:]]*export[[:space:]]\+AWS_PROFILE=.*/unset AWS_PROFILE/' deploy.sh
-          # Comment out all lines that do git or create-repository
           sed -i '/aws codecommit create-repository/ s/^/#/' deploy.sh
           sed -i '/git remote remove origin/ s/^/#/' deploy.sh
           sed -i '/git remote add origin/ s/^/#/' deploy.sh
@@ -131,18 +128,7 @@ jobs:
             done
           fi
 
-      - name: Debug CloudFormation stack
-        run: |
-          aws cloudformation describe-stacks --stack-name TEAM-IDC-APP --region ${{ vars.AWS_REGION }} || echo "Stack does not exist"
-          aws cloudformation list-stacks --region ${{ vars.AWS_REGION }} --query "StackSummaries[?contains(StackName, 'TEAM-IDC-APP')].[StackName, StackStatus]" --output table
-
-      - name: Debug stack outputs
-        run: |
-          aws cloudformation describe-stacks --stack-name TEAM-IDC-APP --region ${{ vars.AWS_REGION }} --query "Stacks[0].Outputs" --output table
-
-      # ---------- STEP 3: Retrieve SAML parameters directly (replaces integration.sh) ----------
-
-
+      # ---------- STEP 3: Retrieve Cognito and Amplify details ----------
       - name: Retrieve SAML parameters from CloudFormation
         id: saml
         run: |
@@ -158,10 +144,9 @@ jobs:
           AMPLIFY_DOMAIN=$(aws amplify get-app --app-id $APP_ID --query "app.defaultDomain" --output text)
           echo "AMPLIFY_DOMAIN=$AMPLIFY_DOMAIN" >> $GITHUB_OUTPUT
 
-          # Get Cognito User Pool ID by exact name pattern (from the original TEAM script)
+          # Get Cognito User Pool ID by name pattern (from the TEAM script)
           USER_POOL_ID=$(aws cognito-idp list-user-pools --max-results 20 --region ${{ vars.AWS_REGION }} --query "UserPools[?contains(Name, 'team06dbb7fc')].Id" --output text)
           if [ -z "$USER_POOL_ID" ]; then
-            # Fallback: get the first user pool (should not happen)
             USER_POOL_ID=$(aws cognito-idp list-user-pools --max-results 1 --region ${{ vars.AWS_REGION }} --query "UserPools[0].Id" --output text)
           fi
           if [ -z "$USER_POOL_ID" ]; then
@@ -170,143 +155,21 @@ jobs:
           fi
           echo "USER_POOL_ID=$USER_POOL_ID" >> $GITHUB_OUTPUT
 
-          # Get Cognito client ID (the one with name containing 'clientWeb' or 'team-app-client')
-          CLIENT_ID=$(aws cognito-idp list-user-pool-clients --user-pool-id $USER_POOL_ID --query "UserPoolClients[?contains(ClientName, 'clientWeb') || contains(ClientName, 'team-app-client')].ClientId" --output text | head -1)
+          # Get Cognito client ID (web client)
+          CLIENT_ID=$(aws cognito-idp list-user-pool-clients --user-pool-id $USER_POOL_ID --query "UserPoolClients[?contains(ClientName, 'clientWeb')].ClientId" --output text | head -1)
           if [ -z "$CLIENT_ID" ]; then
-            # Fallback to first client
             CLIENT_ID=$(aws cognito-idp list-user-pool-clients --user-pool-id $USER_POOL_ID --query "UserPoolClients[0].ClientId" --output text)
           fi
           echo "CLIENT_ID=$CLIENT_ID" >> $GITHUB_OUTPUT
 
-          # Build SAML URLs
-          COGNITO_DOMAIN="${USER_POOL_ID}.auth.${{ vars.AWS_REGION }}.amazoncognito.com"
-          REDIRECT_URI="https://main.${AMPLIFY_DOMAIN}/"
-
-          START_URL="https://${COGNITO_DOMAIN}/authorize?client_id=${CLIENT_ID}&response_type=code&scope=aws.cognito.signin.user.admin+email+openid+phone+profile&redirect_uri=${REDIRECT_URI}&idp_identifier=team"
-          ACS_URL="https://${COGNITO_DOMAIN}/saml2/idpresponse"
-          AUDIENCE="urn:amazon:cognito:sp:${USER_POOL_ID}"
-
-          echo "START_URL=$START_URL" >> $GITHUB_OUTPUT
-          echo "ACS_URL=$ACS_URL" >> $GITHUB_OUTPUT
-          echo "AUDIENCE=$AUDIENCE" >> $GITHUB_OUTPUT
-     
-
-      # ---------- STEP 4: Create SAML app in management account ----------
-      
-
-      # ---------- STEP 4: Create/Update SAML app in management account ----------
-      - name: Switch to management account (Role A) for SAML app
-        uses: aws-actions/configure-aws-credentials@v4
-        with:
-          role-to-assume: arn:aws:iam::${{ vars.MANAGEMENT_ACCOUNT }}:role/GitHubActions-TEAM-RoleA
-          aws-region: ${{ vars.AWS_REGION }}
-
-      - name: Create or update SAML 2.0 application (fully automated)
-        id: saml_app
-        run: |
-          START_URL="${{ steps.saml.outputs.START_URL }}"
-          ACS_URL="${{ steps.saml.outputs.ACS_URL }}"
-          AUDIENCE="${{ steps.saml.outputs.AUDIENCE }}"
-          APP_NAME="TEAM-IDC-APP"
-          INSTANCE_ARN=$(aws sso-admin list-instances --region ${{ vars.AWS_REGION }} --query 'Instances[0].InstanceArn' --output text)
-
-          # 1. Get or create application
-          APP_ARN=$(aws sso-admin list-applications --instance-arn $INSTANCE_ARN --region ${{ vars.AWS_REGION }} \
-            --query "Applications[?Name=='$APP_NAME'].ApplicationArn" --output text)
-
-          if [ -z "$APP_ARN" ] || [ "$APP_ARN" == "None" ]; then
-            echo "Creating new SAML application..."
-            APP_ARN=$(aws sso-admin create-application \
-              --instance-arn $INSTANCE_ARN \
-              --application-provider-arn "arn:aws:sso::aws:applicationProvider/custom-saml" \
-              --name "$APP_NAME" \
-              --description "TEAM Temporary Elevated Access Management" \
-              --portal-options "{\"SignInOptions\": {\"Origin\": \"APPLICATION\", \"ApplicationUrl\": \"$START_URL\"}, \"Visibility\": \"VISIBLE\"}" \
-              --query 'ApplicationArn' --output text)
-          else
-            echo "Application exists, updating portal options..."
-            aws sso-admin update-application \
-              --application-arn $APP_ARN \
-              --portal-options "{\"SignInOptions\": {\"Origin\": \"APPLICATION\", \"ApplicationUrl\": \"$START_URL\"}}"
-          fi
-
-          # 2. Configure SAML authentication method (ACS URL and Audience)
-          aws sso-admin put-application-authentication-method \
-            --application-arn $APP_ARN \
-            --authentication-method-type "SAML" \
-            --authentication-method "{
-              \"Saml\": {
-                \"InstanceMetadata\": {
-                  \"AuthenticationSymmetricAlgorithm\": \"AES128\",
-                  \"ReplyUrls\": {
-                    \"AssertionConsumerServiceUrls\": [\"$ACS_URL\"]
-                  },
-                  \"Audience\": \"$AUDIENCE\"
-                }
-              }
-            }"
-
-          # 3. Configure attribute mappings (Subject and Email)
-          aws sso-admin put-application-assignment-configuration \
-            --application-arn $APP_ARN \
-            --assignment-configuration "{
-              \"Attributes\": [
-                {
-                  \"Value\": \"\${user:subject}\",
-                  \"Configuration\": {
-                    \"Saml\": {
-                      \"AttributeName\": \"Subject\",
-                      \"Format\": \"urn:oasis:names:tc:SAML:2.0:nameid-format:persistent\"
-                    }
-                  }
-                },
-                {
-                  \"Value\": \"\${user:email}\",
-                  \"Configuration\": {
-                    \"Saml\": {
-                      \"AttributeName\": \"email\",
-                      \"Format\": \"urn:oasis:names:tc:SAML:2.0:attrname-format:basic\"
-                    }
-                  }
-                }
-              ]
-            }"
-
-          # 4. Retrieve the SAML metadata URL
-          METADATA_URL=$(aws sso-admin get-application \
-            --application-arn $APP_ARN \
-            --query 'Application.InstanceMetadata.SsoSamlMetadataUrl' --output text)
-
-          if [ -z "$METADATA_URL" ]; then
-            echo "ERROR: Could not retrieve metadata URL"
-            exit 1
-          fi
-
-          echo "METADATA_URL=$METADATA_URL" >> $GITHUB_OUTPUT
-          echo "APP_ARN=$APP_ARN" >> $GITHUB_OUTPUT
-
-      # ---------- STEP 5: Assume Role B again for Cognito configuration ----------
-      - name: Assume Role B again for Cognito configuration
-        run: |
-          CREDS=$(aws sts assume-role \
-            --role-arn "${{ vars.TEAM_ROLE_B_ARN }}" \
-            --role-session-name "GitHubActionsRoleB" \
-            --duration-seconds 3600 \
-            --output json)
-          echo "AWS_ACCESS_KEY_ID=$(echo $CREDS | jq -r .Credentials.AccessKeyId)" >> $GITHUB_ENV
-          echo "AWS_SECRET_ACCESS_KEY=$(echo $CREDS | jq -r .Credentials.SecretAccessKey)" >> $GITHUB_ENV
-          echo "AWS_SESSION_TOKEN=$(echo $CREDS | jq -r .Credentials.SessionToken)" >> $GITHUB_ENV
-          echo "AWS_REGION=${{ vars.AWS_REGION }}" >> $GITHUB_ENV
-          echo "AWS_DEFAULT_REGION=${{ vars.AWS_REGION }}" >> $GITHUB_ENV
-          echo "Successfully assumed Role B again"
-          aws sts get-caller-identity
-
+      # ---------- STEP 4: Configure Cognito using pre‑stored SAML metadata URL ----------
       - name: Configure Cognito Identity Provider (SAML)
         run: |
-          # Create or update the SAML identity provider in Cognito
           PROVIDER_NAME="IAMIdentityCenter"
           USER_POOL_ID="${{ steps.saml.outputs.USER_POOL_ID }}"
-          METADATA_URL="${{ steps.saml_app.outputs.METADATA_URL }}"
+          METADATA_URL="${{ vars.SAML_METADATA_URL }}"
+          CLIENT_ID="${{ steps.saml.outputs.CLIENT_ID }}"
+          AMPLIFY_DOMAIN="${{ steps.saml.outputs.AMPLIFY_DOMAIN }}"
 
           # Check if provider exists
           EXISTS=$(aws cognito-idp list-identity-providers \
@@ -332,9 +195,7 @@ jobs:
               --attribute-mapping "email=email"
           fi
 
-          # Update the user pool client to use this provider
-          CLIENT_ID="${{ steps.saml.outputs.CLIENT_ID }}"
-          AMPLIFY_DOMAIN="${{ steps.saml.outputs.AMPLIFY_DOMAIN }}"
+          # Update user pool client
           aws cognito-idp update-user-pool-client \
             --user-pool-id "$USER_POOL_ID" \
             --client-id "$CLIENT_ID" \
@@ -345,11 +206,10 @@ jobs:
             --logout-urls "https://main.${AMPLIFY_DOMAIN}/" \
             --callback-urls "https://main.${AMPLIFY_DOMAIN}/" \
             --allowed-o-auth-flows-user-pool-client
-     
+
       - name: (Optional) Setup machine authentication
         run: |
           cd deployment
-          # Patch api-machine-auth.sh to unset AWS_PROFILE
           sed -i 's/^[[:space:]]*export[[:space:]]\+AWS_PROFILE=.*/unset AWS_PROFILE/' api-machine-auth.sh 2>/dev/null || true
           chmod +x api-machine-auth.sh
           ./api-machine-auth.sh || echo "Machine auth setup skipped."
