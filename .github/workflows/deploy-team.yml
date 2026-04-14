@@ -198,7 +198,6 @@ jobs:
           role-to-assume: arn:aws:iam::${{ vars.MANAGEMENT_ACCOUNT }}:role/GitHubActions-TEAM-RoleA
           aws-region: ${{ vars.AWS_REGION }}
 
-
       - name: Create or update SAML 2.0 application
         id: saml_app
         run: |
@@ -212,17 +211,18 @@ jobs:
               --description "TEAM Temporary Elevated Access Management" \
               --application-provider-arn "arn:aws:sso::aws:applicationProvider/custom" \
               --instance-arn "$INSTANCE_ARN" \
-              --portal-options "{\"SignInOptions\": {\"Origin\": \"${START_URL}\", \"ApplicationUrl\": \"${START_URL}\"}}" \
+              --portal-options "{\"SignInOptions\": {\"Origin\": \"APPLICATION\", \"ApplicationUrl\": \"${START_URL}\"}}" \
               --query "ApplicationArn" --output text)
           else
             echo "Updating existing SAML application: $APP_ARN"
             aws sso-admin update-application \
               --application-arn "$APP_ARN" \
-              --portal-options "{\"SignInOptions\": {\"Origin\": \"${START_URL}\", \"ApplicationUrl\": \"${START_URL}\"}}"
+              --portal-options "{\"SignInOptions\": {\"Origin\": \"APPLICATION\", \"ApplicationUrl\": \"${START_URL}\"}}"
           fi
           METADATA_URL="https://portal.sso.${{ vars.AWS_REGION }}.amazonaws.com/saml/metadata/$(echo $INSTANCE_ARN | cut -d'/' -f2)"
           echo "METADATA_URL=$METADATA_URL" >> $GITHUB_OUTPUT
           echo "APP_ARN=$APP_ARN" >> $GITHUB_OUTPUT
+      
       
 
       # ---------- STEP 5: Configure Cognito (back to TEAM account) ----------
