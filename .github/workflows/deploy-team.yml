@@ -199,12 +199,24 @@ jobs:
           role-to-assume: arn:aws:iam::${{ vars.MANAGEMENT_ACCOUNT }}:role/GitHubActions-TEAM-RoleA
           aws-region: ${{ vars.AWS_REGION }}
 
-      - name: Create or update SAML 2.0 application and get metadata URL
+      - name: Create or update SAML 2.0 application with correct SAML metadata
         id: saml_app
         run: |
           INSTANCE_ARN=$(aws sso-admin list-instances --region ${{ vars.AWS_REGION }} --query "Instances[0].InstanceArn" --output text)
           APP_ARN=$(aws sso-admin list-applications --region ${{ vars.AWS_REGION }} --instance-arn "$INSTANCE_ARN" --query "Applications[?Name=='TEAM-IDC-APP'].ApplicationArn" --output text)
           START_URL="${{ steps.saml.outputs.START_URL }}"
+          ACS_URL="${{ steps.saml.outputs.ACS_URL }}"
+          AUDIENCE="${{ steps.saml.outputs.AUDIENCE }}"
+          
+          # Create the SAML metadata XML document for Cognito as SP
+          cat > saml-metadata.xml <<EOF
+          <EntityDescriptor entityID="${AUDIENCE}" xmlns="urn:oasis:names:tc:SAML:2.0:metadata">
+            <SPSSODescriptor AuthnRequestsSigned="false" WantAssertionsSigned="true" protocolSupportEnumeration="urn:oasis:names:tc:SAML:2.0:protocol">
+              <AssertionConsumerService index="0" isDefault="true" Binding="urn:oasis:names:tc:SAML:2.0:bindings:HTTP-POST" Location="${ACS_URL}"/>
+            </SPSSODescriptor>
+          </EntityDescriptor>
+          EOF
+          
           if [ -z "$APP_ARN" ]; then
             echo "Creating new SAML application..."
             APP_ARN=$(aws sso-admin create-application \
@@ -214,20 +226,27 @@ jobs:
               --instance-arn "$INSTANCE_ARN" \
               --portal-options "{\"SignInOptions\": {\"Origin\": \"APPLICATION\", \"ApplicationUrl\": \"${START_URL}\"}}" \
               --query "ApplicationArn" --output text)
+            # Wait for creation to propagate
+            sleep 5
+            # Update the application with the SAML metadata
+            aws sso-admin update-application \
+              --application-arn "$APP_ARN" \
+              --saml-metadata-document file://saml-metadata.xml
           else
             echo "Updating existing SAML application: $APP_ARN"
             aws sso-admin update-application \
               --application-arn "$APP_ARN" \
               --portal-options "{\"SignInOptions\": {\"Origin\": \"APPLICATION\", \"ApplicationUrl\": \"${START_URL}\"}}"
+            aws sso-admin update-application \
+              --application-arn "$APP_ARN" \
+              --saml-metadata-document file://saml-metadata.xml
           fi
-          echo "APP_ARN=$APP_ARN" >> $GITHUB_OUTPUT
-          # Get the application's metadata URL directly from the application details
-          METADATA_URL=$(aws sso-admin get-application --application-arn $APP_ARN --query "ApplicationMetadata" --output text)
-          if [ -z "$METADATA_URL" ]; then
-            echo "ERROR: Could not retrieve metadata URL from application"
-            exit 1
-          fi
-          echo "METADATA_URL=$METADATA_URL" >> $GITHUB_OUTPUT
+          
+          # Now retrieve the metadata URL from the application (after update)
+          # The metadata URL is not directly returned, but we can construct it from the application ID
+          APP_ID_FROM_ARN=$(echo $APP_ARN | cut -d'/' -f3)
+          METADATA_URL="https://portal.sso.${{ vars.AWS_REGION }}.amazonaws.com/saml/metadata/${APP_ID_FROM_ARN}"
+          echo "METADATA_URL=$METADATA_URL" >> $GITHUB_OUTPUT 
       
       # ---------- STEP 5: Assume Role B again (TEAM account) for Cognito configuration ----------
       - name: Assume Role B again for Cognito configuration
