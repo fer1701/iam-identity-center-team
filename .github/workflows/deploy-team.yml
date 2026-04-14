@@ -220,9 +220,11 @@ jobs:
               --application-arn "$APP_ARN" \
               --portal-options "{\"SignInOptions\": {\"Origin\": \"APPLICATION\", \"ApplicationUrl\": \"${START_URL}\"}}"
           fi
-          METADATA_URL="https://portal.sso.${{ vars.AWS_REGION }}.amazonaws.com/saml/metadata/$(echo $INSTANCE_ARN | cut -d'/' -f2)"
+          # Extract application ID from ARN (format: arn:aws:sso:::application/instanceId/appId)
+          APP_ID_FROM_ARN=$(echo $APP_ARN | cut -d'/' -f3)
+          METADATA_URL="https://portal.sso.${{ vars.AWS_REGION }}.amazonaws.com/saml/metadata/${APP_ID_FROM_ARN}"
           echo "METADATA_URL=$METADATA_URL" >> $GITHUB_OUTPUT
-
+      
       # ---------- STEP 5: Assume Role B again (TEAM account) for Cognito configuration ----------
       - name: Assume Role B again for Cognito configuration
         run: |
