@@ -135,26 +135,32 @@ jobs:
           fi
           echo "APP_ID=$APP_ID" >> $GITHUB_OUTPUT
 
-          # Wait for Amplify status to become AVAILABLE
+          # Wait for defaultDomain to be non-empty (app is deployed)
           for i in {1..60}; do
-            STATUS=$(aws amplify get-app --app-id $APP_ID --query "app.status" --output text 2>/dev/null || echo "UNKNOWN")
-            echo "Attempt $i/60: Amplify status = $STATUS"
-            if [ "$STATUS" = "AVAILABLE" ]; then
+            DOMAIN=$(aws amplify get-app --app-id $APP_ID --query "app.defaultDomain" --output text 2>/dev/null || echo "")
+            if [ -n "$DOMAIN" ]; then
+              echo "Default domain found: $DOMAIN"
               break
-            elif [ "$STATUS" = "FAILED" ]; then
-              echo "ERROR: Amplify build failed. Check Amplify console."
-              exit 1
             fi
+            echo "Attempt $i/60: Waiting for default domain..."
             sleep 30
           done
-          if [ $i -ge 60 ]; then
-            echo "ERROR: Amplify not AVAILABLE after 30 minutes."
+          if [ -z "$DOMAIN" ]; then
+            echo "ERROR: No default domain after 30 minutes."
             exit 1
           fi
-
-          # Get Amplify domain
-          AMPLIFY_DOMAIN=$(aws amplify get-app --app-id $APP_ID --query "app.defaultDomain" --output text)
+          AMPLIFY_DOMAIN=$DOMAIN
           echo "AMPLIFY_DOMAIN=$AMPLIFY_DOMAIN" >> $GITHUB_OUTPUT
+
+          # Wait for the app to be reachable (optional)
+          for i in {1..30}; do
+            if curl -s -o /dev/null -w "%{http_code}" "https://main.${AMPLIFY_DOMAIN}/" | grep -q "200"; then
+              echo "App is reachable."
+              break
+            fi
+            echo "Attempt $i/30: Waiting for app to respond..."
+            sleep 10
+          done
 
           # Get Cognito User Pool ID (from stack output or fallback)
           USER_POOL_ID=$(aws cloudformation describe-stacks --stack-name TEAM-IDC-APP --query "Stacks[0].Outputs[?OutputKey=='UserPoolId'].OutputValue" --output text)
