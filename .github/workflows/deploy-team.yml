@@ -114,62 +114,57 @@ jobs:
           ./deploy.sh
 
       # ---------- STEP 3: Wait for Amplify and retrieve SAML parameters (combined) ----------
+
       - name: Wait for Amplify and retrieve SAML parameters
         id: saml
+        timeout-minutes: 30
         run: |
-          # Wait for Amplify app to exist
-          echo "Waiting for Amplify app TEAM-IDC-APP..."
-          APP_ID=""
-          while [ -z "$APP_ID" ]; do
-            APP_ID=$(aws amplify list-apps --region ${{ vars.AWS_REGION }} --query "apps[?name=='TEAM-IDC-APP'].appId" --output text)
-            if [ -z "$APP_ID" ]; then
-              echo "Amplify app not yet found, waiting 10 seconds..."
-              sleep 10
-            fi
-          done
+          set -x
+          # Get App ID from CloudFormation outputs
+          APP_ID=$(aws cloudformation describe-stacks --stack-name TEAM-IDC-APP --query "Stacks[0].Outputs[?OutputKey=='AppId'].OutputValue" --output text)
+          if [ -z "$APP_ID" ]; then
+            echo "ERROR: Could not retrieve AppId from stack outputs"
+            exit 1
+          fi
           echo "APP_ID=$APP_ID" >> $GITHUB_OUTPUT
 
-          # Wait for Amplify build to complete (status AVAILABLE)
-          while true; do
+          # Wait for Amplify status AVAILABLE
+          for i in {1..60}; do
             STATUS=$(aws amplify get-app --app-id $APP_ID --query "app.status" --output text 2>/dev/null || echo "UNKNOWN")
-            echo "Amplify status: $STATUS"
+            echo "Attempt $i/60: Amplify status = $STATUS"
             if [ "$STATUS" = "AVAILABLE" ]; then
               break
             elif [ "$STATUS" = "FAILED" ]; then
-              echo "Amplify build failed. Check Amplify console."
               exit 1
             fi
             sleep 30
           done
+          if [ $i -ge 60 ]; then
+            echo "ERROR: Amplify not AVAILABLE after 30 minutes"
+            exit 1
+          fi
 
           # Get Amplify domain
           AMPLIFY_DOMAIN=$(aws amplify get-app --app-id $APP_ID --query "app.defaultDomain" --output text)
           echo "AMPLIFY_DOMAIN=$AMPLIFY_DOMAIN" >> $GITHUB_OUTPUT
 
-          # Wait for Cognito user pool
-          echo "Waiting for Cognito user pool..."
-          USER_POOL_ID=""
-          while [ -z "$USER_POOL_ID" ]; do
+          # Get Cognito User Pool ID from stack outputs
+          USER_POOL_ID=$(aws cloudformation describe-stacks --stack-name TEAM-IDC-APP --query "Stacks[0].Outputs[?OutputKey=='UserPoolId'].OutputValue" --output text)
+          if [ -z "$USER_POOL_ID" ]; then
+            # Fallback to listing
             USER_POOL_ID=$(aws cognito-idp list-user-pools --max-results 20 --region ${{ vars.AWS_REGION }} --query "UserPools[?contains(Name, 'team06dbb7fc')].Id" --output text)
-            if [ -z "$USER_POOL_ID" ]; then
-              echo "User pool not yet found, waiting 10 seconds..."
-              sleep 10
-            fi
-          done
+          fi
+          if [ -z "$USER_POOL_ID" ]; then
+            echo "ERROR: Could not retrieve User Pool ID"
+            exit 1
+          fi
           echo "USER_POOL_ID=$USER_POOL_ID" >> $GITHUB_OUTPUT
 
-          # Wait for Cognito client ID
-          CLIENT_ID=""
-          while [ -z "$CLIENT_ID" ]; do
-            CLIENT_ID=$(aws cognito-idp list-user-pool-clients --user-pool-id $USER_POOL_ID --query "UserPoolClients[?contains(ClientName, 'clientWeb') || contains(ClientName, 'team-app-client')].ClientId" --output text | head -1)
-            if [ -z "$CLIENT_ID" ]; then
-              CLIENT_ID=$(aws cognito-idp list-user-pool-clients --user-pool-id $USER_POOL_ID --query "UserPoolClients[0].ClientId" --output text)
-            fi
-            if [ -z "$CLIENT_ID" ]; then
-              echo "Client ID not yet found, waiting 10 seconds..."
-              sleep 10
-            fi
-          done
+          # Get Cognito client ID from stack outputs or list
+          CLIENT_ID=$(aws cloudformation describe-stacks --stack-name TEAM-IDC-APP --query "Stacks[0].Outputs[?OutputKey=='ClientId'].OutputValue" --output text)
+          if [ -z "$CLIENT_ID" ]; then
+            CLIENT_ID=$(aws cognito-idp list-user-pool-clients --user-pool-id $USER_POOL_ID --query "UserPoolClients[0].ClientId" --output text)
+          fi
           echo "CLIENT_ID=$CLIENT_ID" >> $GITHUB_OUTPUT
 
           # Build SAML URLs
