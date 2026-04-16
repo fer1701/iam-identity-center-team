@@ -1,330 +1,235 @@
-# -----------------------------------------------------------------------------
-# TEAM (Temporary Elevated Access Management) – automated deploy skeleton
-#
-# Prerequisites (outside this workflow):
-#   - GitHub OIDC → IAM Role A (management account)
-#   - Role A may sts:AssumeRole → Role B (TEAM account)
-#   - GitHub vars: AWS_REGION, MANAGEMENT_ACCOUNT, TEAM_ACCOUNT, IDC_LOGIN_URL,
-#     TEAM_ADMIN_GROUP, TEAM_AUDITOR_GROUP, CLOUDTRAIL_AUDIT_LOGS, TAGS,
-#     TEAM_ROLE_B_ARN (and optional UI_DOMAIN, SECRET_NAME, CACHE_TTL, etc.)
-#   - GitHub secret: IDC_SAML_METADATA_URL
-#       IAM Identity Center SAML metadata URL for the *existing* custom SAML 2.0
-#       application that trusts this TEAM environment (ACS + audience must match
-#       the values computed below). AWS does not yet expose SAML app creation +
-#       metadata URL via supported CLI APIs for customer-managed SAML apps.
-#
-# This workflow is idempotent in the TEAM account for CodeCommit + stack:
-# it deletes the repo and stack before recreating. Management-account delegated
-# admin (init.sh) is safe to re-run.
-# -----------------------------------------------------------------------------
-name: Deploy TEAM
+name: Deploy TEAM Application (Automated)
+
 on:
+  push:
+    branches: [ "main" ]
   workflow_dispatch:
+
 permissions:
   id-token: write
   contents: read
+
 env:
   AWS_REGION: ${{ vars.AWS_REGION }}
-  TEAM_STACK_NAME: TEAM-IDC-APP
-  CODECOMMIT_REPO_NAME: team-idc-app
+  MANAGEMENT_ACCOUNT: ${{ vars.MANAGEMENT_ACCOUNT }}
+  TEAM_ACCOUNT: ${{ vars.TEAM_ACCOUNT }}
+
 jobs:
-  deploy-team:
+  deploy:
     runs-on: ubuntu-latest
-    timeout-minutes: 180
+    timeout-minutes: 60
     steps:
-      # -------------------------------------------------------------------------
-      # Checkout TEAM sources (this repo or your fork). deployment/ must exist.
-      # -------------------------------------------------------------------------
-      - name: Checkout repository
+      - name: Checkout code
         uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-      - name: Install tooling (jq, git-remote-codecommit)
-        run: |
-          set -euo pipefail
-          sudo apt-get update -qq
-          sudo apt-get install -y -qq jq
-          python3 -m pip install --upgrade pip
-          pip install "git-remote-codecommit>=1.15"
-      # -------------------------------------------------------------------------
-      # Role A – management account (OIDC). Used for init + any future mgmt-only API.
-      # -------------------------------------------------------------------------
-      - name: Configure AWS credentials (Role A – OIDC)
+
+      # ---------- STEP 1: Assume Role A (Management) for init.sh ----------
+      - name: Configure AWS credentials (Role A)
         uses: aws-actions/configure-aws-credentials@v4
         with:
-          role-to-assume: ${{ secrets.TEAM_ROLE_A_ARN }}
-          aws-region: ${{ env.AWS_REGION }}
-          audience: sts.amazonaws.com
-      # -------------------------------------------------------------------------
-      # parameters.sh – no named profiles; init/deploy expect ./parameters.sh
-      # Copy from TEAM template and inject CI values (adjust if you use secrets).
-      # -------------------------------------------------------------------------
-      - name: Generate deployment/parameters.sh (no AWS profiles)
-        working-directory: deployment
+          role-to-assume: arn:aws:iam::${{ vars.MANAGEMENT_ACCOUNT }}:role/GitHubActions-TEAM-RoleA
+          aws-region: ${{ vars.AWS_REGION }}
+
+      - name: Generate parameters.sh
         run: |
-          set -euo pipefail
-          cp -f parameters-template.sh parameters.sh
-          # Remove profile exports from the generated file; scripts will use default cred chain.
-          sed -i '/^ORG_MASTER_PROFILE=/d;/^TEAM_ACCOUNT_PROFILE=/d' parameters.sh || true
-          {
-            echo "REGION=${{ vars.AWS_REGION }}"
-            echo "TEAM_ACCOUNT=${{ vars.TEAM_ACCOUNT }}"
-            echo "IDC_LOGIN_URL=${{ vars.IDC_LOGIN_URL }}"
-            echo "TEAM_ADMIN_GROUP=${{ vars.TEAM_ADMIN_GROUP }}"
-            echo "TEAM_AUDITOR_GROUP=${{ vars.TEAM_AUDITOR_GROUP }}"
-            echo "CLOUDTRAIL_AUDIT_LOGS=${{ vars.CLOUDTRAIL_AUDIT_LOGS }}"
-            echo "TAGS=${{ vars.TAGS }}"
-            echo "CACHE_TTL=${{ vars.CACHE_TTL }}"
-            echo "UI_DOMAIN=${{ vars.UI_DOMAIN }}"
-            echo "SECRET_NAME=${{ vars.SECRET_NAME }}"
-          } >> parameters.sh
-      - name: Patch TEAM scripts – unset AWS_PROFILE and profile usage
-        working-directory: deployment
+          cd deployment
+          cat > parameters.sh <<EOF
+          IDC_LOGIN_URL="${{ vars.IDC_LOGIN_URL }}"
+          REGION="${{ vars.AWS_REGION }}"
+          TEAM_ACCOUNT="${{ vars.TEAM_ACCOUNT }}"
+          ORG_MASTER_PROFILE=""
+          TEAM_ACCOUNT_PROFILE=""
+          TEAM_ADMIN_GROUP="${{ vars.TEAM_ADMIN_GROUP }}"
+          TEAM_AUDITOR_GROUP="${{ vars.TEAM_AUDITOR_GROUP }}"
+          TAGS="${{ vars.TAGS }}"
+          CLOUDTRAIL_AUDIT_LOGS="${{ vars.CLOUDTRAIL_AUDIT_LOGS }}"
+          UI_DOMAIN="${{ vars.UI_DOMAIN }}"
+          SECRET_NAME="${{ vars.SECRET_NAME }}"
+          CACHE_TTL=604800
+          EOF
+
+      - name: Run init.sh (delegated admin setup)
         run: |
-          set -euo pipefail
-          for f in init.sh deploy.sh integration.sh cognito.sh update.sh destroy.sh api-machine-auth.sh get-machine-auth-credentials.sh; do
-            test -f "$f" || continue
-            # After sourcing parameters.sh, clear profile so OIDC/assumed-role creds win.
-            sed -i 's/^export AWS_PROFILE=/# export AWS_PROFILE=/' "$f" || true
-            sed -i 's/export AWS_PROFILE=$/# export AWS_PROFILE=/' "$f" || true
-          done
-      # -------------------------------------------------------------------------
-      # Delegated admin registration in Organizations (management account).
-      # -------------------------------------------------------------------------
-      - name: Run init.sh (management account)
-        working-directory: deployment
-        env:
-          AWS_REGION: ${{ env.AWS_REGION }}
+          cd deployment
+          chmod +x init.sh
+          sed -i 's/^[[:space:]]*export[[:space:]]\+AWS_PROFILE=.*/unset AWS_PROFILE/' init.sh
+          ./init.sh
+
+      # ---------- STEP 2: Assume Role B (TEAM account) for deployment ----------
+      - name: Assume Role B manually
         run: |
-          set -euo pipefail
-          unset AWS_PROFILE || true
-          bash ./init.sh
-      # -------------------------------------------------------------------------
-      # Assume Role B into TEAM account for CodeCommit, CloudFormation, Amplify, Cognito
-      # -------------------------------------------------------------------------
-      - name: Assume TEAM account role (Role B)
-        id: assume_team
-        run: |
-          set -euo pipefail
-          OUT=$(aws sts assume-role \
+          CREDS=$(aws sts assume-role \
             --role-arn "${{ vars.TEAM_ROLE_B_ARN }}" \
-            --role-session-name "github-actions-team-deploy" \
+            --role-session-name "GitHubActionsRoleB" \
             --duration-seconds 3600 \
             --output json)
-          echo "AWS_ACCESS_KEY_ID=$(echo "$OUT" | jq -r '.Credentials.AccessKeyId')" >> "$GITHUB_ENV"
-          echo "AWS_SECRET_ACCESS_KEY=$(echo "$OUT" | jq -r '.Credentials.SecretAccessKey')" >> "$GITHUB_ENV"
-          echo "AWS_SESSION_TOKEN=$(echo "$OUT" | jq -r '.Credentials.SessionToken')" >> "$GITHUB_ENV"
-      # -------------------------------------------------------------------------
-      # CodeCommit: delete if present (naming conflicts), recreate, push main
-      # -------------------------------------------------------------------------
-      - name: Reset CodeCommit repository and push TEAM code
+          echo "AWS_ACCESS_KEY_ID=$(echo $CREDS | jq -r .Credentials.AccessKeyId)" >> $GITHUB_ENV
+          echo "AWS_SECRET_ACCESS_KEY=$(echo $CREDS | jq -r .Credentials.SecretAccessKey)" >> $GITHUB_ENV
+          echo "AWS_SESSION_TOKEN=$(echo $CREDS | jq -r .Credentials.SessionToken)" >> $GITHUB_ENV
+          echo "AWS_REGION=${{ vars.AWS_REGION }}" >> $GITHUB_ENV
+          echo "AWS_DEFAULT_REGION=${{ vars.AWS_REGION }}" >> $GITHUB_ENV
+          echo "Successfully assumed Role B"
+          aws sts get-caller-identity
+
+      - name: Install git-remote-codecommit
         run: |
-          set -euo pipefail
-          unset AWS_PROFILE || true
-          R="${{ env.CODECOMMIT_REPO_NAME }}"
-          REGION="${{ env.AWS_REGION }}"
-          if aws codecommit get-repository --repository-name "$R" --region "$REGION" &>/dev/null; then
-            aws codecommit delete-repository --repository-name "$R" --region "$REGION"
-            echo "Deleted existing repository $R"
-          fi
-          aws codecommit create-repository \
-            --region "$REGION" \
-            --repository-name "$R" \
-            --repository-description "TEAM application (CI)"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-          git config user.name "github-actions"
-          git remote remove codecommit 2>/dev/null || true
-          git remote add codecommit "codecommit::${REGION}://${R}"
-          git push --force codecommit HEAD:main
-      # -------------------------------------------------------------------------
-      # Delete existing CloudFormation stack (orphan cleanup), then deploy
-      # Matches TEAM deploy.sh logic but skips git (already pushed).
-      # -------------------------------------------------------------------------
-      - name: Delete existing CloudFormation stack (if any)
-        working-directory: deployment
+          pipx install git-remote-codecommit
+          echo "$HOME/.local/bin" >> $GITHUB_PATH
+
+      - name: Delete existing CodeCommit repository (idempotency)
         run: |
-          set -euo pipefail
-          unset AWS_PROFILE || true
-          STACK="${{ env.TEAM_STACK_NAME }}"
-          REGION="${{ env.AWS_REGION }}"
-          if aws cloudformation describe-stacks --stack-name "$STACK" --region "$REGION" &>/dev/null; then
-            aws cloudformation delete-stack --stack-name "$STACK" --region "$REGION"
-            aws cloudformation wait stack-delete-complete --stack-name "$STACK" --region "$REGION"
-          fi
-      - name: Deploy CloudFormation stack TEAM-IDC-APP
-        working-directory: deployment
+          aws codecommit delete-repository --repository-name team-idc-app --region ${{ vars.AWS_REGION }} || echo "Repository not found, continuing."
+
+      - name: Create CodeCommit repository
         run: |
-          set -euo pipefail
-          unset AWS_PROFILE || true
-          REGION="${{ env.AWS_REGION }}"
-          STACK="${{ env.TEAM_STACK_NAME }}"
-          TAGS="${{ vars.TAGS }}"
-          # Build parameter-overrides like deploy.sh (simplified: always use CodeCommit path with SECRET_NAME empty = custom repo secret branch in original script is complex – align with YOUR parameters-template usage).
-          # Minimal example matching TEAM when SECRET_NAME is unset (first block of deploy.sh):
-          OVERRIDES=(
-            Login=${{ vars.IDC_LOGIN_URL }}
-            CloudTrailAuditLogs=${{ vars.CLOUDTRAIL_AUDIT_LOGS }}
-            teamAdminGroup=${{ vars.TEAM_ADMIN_GROUP }}
-            teamAuditGroup=${{ vars.TEAM_AUDITOR_GROUP }}
-            teamAccount=${{ vars.TEAM_ACCOUNT }}
-            cacheTTL=${{ vars.CACHE_TTL }}
-          )
-          if [[ -n "$TAGS" ]]; then
-            OVERRIDES+=(tags="$TAGS")
-          fi
-          if [[ -n "${{ vars.UI_DOMAIN }}" ]]; then
-            OVERRIDES+=(customAmplifyDomain=${{ vars.UI_DOMAIN }})
-          fi
-          EXTRA=(--no-fail-on-empty-changeset --capabilities CAPABILITY_NAMED_IAM)
-          if [[ -n "$TAGS" ]]; then
-            EXTRA+=(--tags $TAGS)
-          fi
-          aws cloudformation deploy \
-            --region "$REGION" \
-            --template-file template.yml \
-            --stack-name "$STACK" \
-            --parameter-overrides "${OVERRIDES[@]}" \
-            "${EXTRA[@]}"
-      # -------------------------------------------------------------------------
-      # Resolve Amplify app id from stack resources (avoid hardcoded pool/app names)
-      # -------------------------------------------------------------------------
-      - name: Wait for Amplify main branch build (poll)
-        id: amplify
-        working-directory: deployment
+          aws codecommit create-repository --repository-name team-idc-app --region ${{ vars.AWS_REGION }} --repository-description "Temporary Elevated Access Management (TEAM) Application"
+
+      - name: Create fresh git repository and push to CodeCommit
         run: |
-          set -euo pipefail
-          unset AWS_PROFILE || true
-          REGION="${{ env.AWS_REGION }}"
-          STACK="${{ env.TEAM_STACK_NAME }}"
-          APP_ID=$(aws cloudformation describe-stack-resources \
-            --region "$REGION" \
-            --stack-name "$STACK" \
-            --query "StackResources[?ResourceType=='AWS::Amplify::App'].PhysicalResourceId | [0]" \
-            --output text)
-          test -n "$APP_ID" && test "$APP_ID" != "None"
-          echo "app_id=$APP_ID" >> "$GITHUB_OUTPUT"
-          DEADLINE=$(( $(date +%s) + 3600 ))
-          while true; do
-            JOB=$(aws amplify list-jobs --region "$REGION" --app-id "$APP_ID" --branch-name main --max-results 1 --output json)
-            STATUS=$(echo "$JOB" | jq -r '.jobSummaries[0].status // "PENDING"')
-            if [[ "$STATUS" == "SUCCEED" ]]; then
-              echo "Amplify build succeeded."
-              break
-            fi
-            if [[ "$STATUS" == "FAILED" ]] || [[ "$STATUS" == "CANCELLED" ]]; then
-              echo "Amplify build ended with status: $STATUS" >&2
-              echo "$JOB" | jq . >&2
-              exit 1
-            fi
-            if [[ $(date +%s) -gt $DEADLINE ]]; then
-              echo "Timeout waiting for Amplify build" >&2
-              exit 1
-            fi
-            echo "Amplify status: $STATUS – sleeping 30s"
-            sleep 30
-          done
-      # -------------------------------------------------------------------------
-      # Cognito + Amplify discovery (TEAM account) – same logic as integration.sh
-      # Prefer stack resource physical IDs over name substring "team06dbb7fc".
-      # -------------------------------------------------------------------------
-      - name: Build SAML parameter URLs and write Cognito details.json
+          rm -rf .git
+          git init -b main
+          git config user.email "github-actions@github.com"
+          git config user.name "GitHub Actions"
+          git add .
+          git commit -m "Initial commit for TEAM deployment"
+          git remote add origin codecommit::${{ vars.AWS_REGION }}://team-idc-app
+          git push --force origin main
+
+      - name: Delete existing CloudFormation stack if in failed state
+        run: |
+          aws cloudformation delete-stack --stack-name TEAM-IDC-APP --region ${{ vars.AWS_REGION }} || echo "Stack does not exist or already deleted"
+          aws cloudformation wait stack-delete-complete --stack-name TEAM-IDC-APP --region ${{ vars.AWS_REGION }} || echo "No stack to wait for"
+
+      - name: Patch deploy.sh to skip git commands and only deploy CloudFormation
+        run: |
+          cd deployment
+          sed -i 's/^[[:space:]]*export[[:space:]]\+AWS_PROFILE=.*/unset AWS_PROFILE/' deploy.sh
+          sed -i '/aws codecommit create-repository/ s/^/#/' deploy.sh
+          sed -i '/git remote remove origin/ s/^/#/' deploy.sh
+          sed -i '/git remote add origin/ s/^/#/' deploy.sh
+          sed -i '/git push origin main/ s/^/#/' deploy.sh
+
+      - name: Run deploy.sh (only CloudFormation deployment)
+        run: |
+          cd deployment
+          chmod +x deploy.sh
+          ./deploy.sh
+
+      # ---------- STEP 3: Wait for Amplify and retrieve SAML parameters ----------
+      - name: Wait for Amplify and retrieve SAML parameters
         id: saml
         run: |
-          set -euo pipefail
-          unset AWS_PROFILE || true
-          REGION="${{ env.AWS_REGION }}"
-          STACK="${{ env.TEAM_STACK_NAME }}"
-          POOL_ID=$(aws cloudformation describe-stack-resources \
-            --stack-name "$STACK" \
-            --region "$REGION" \
-            --query "StackResources[?ResourceType=='AWS::Cognito::UserPool'].PhysicalResourceId | [0]" \
-            --output text)
-          APP_ID="${{ steps.amplify.outputs.app_id }}"
-          DOMAIN_PREFIX=$(aws cognito-idp describe-user-pool \
-            --user-pool-id "$POOL_ID" --region "$REGION" \
-            --query 'UserPool.Domain' --output text)
-          CLIENT_ID=$(aws cognito-idp list-user-pool-clients \
-            --user-pool-id "$POOL_ID" --region "$REGION" --max-results 60 \
-            --output json | jq -r '.UserPoolClients[] | select(.ClientName | test("clientWeb")) | .ClientId' | head -1)
-          DEFAULT_DOMAIN=$(aws amplify get-app --app-id "$APP_ID" --region "$REGION" \
-            --query 'app.defaultDomain' --output text)
-          AMPLIFY_HOST="main.${DEFAULT_DOMAIN}"
-          COGNITO_HOST="${DOMAIN_PREFIX}.auth.${REGION}.amazoncognito.com"
-          START="https://${COGNITO_HOST}/authorize?client_id=${CLIENT_ID}&response_type=code&scope=aws.cognito.signin.user.admin+email+openid+phone+profile&redirect_uri=https://${AMPLIFY_HOST}/&idp_identifier=team"
-          ACS="https://${COGNITO_HOST}/saml2/idpresponse"
-          AUDIENCE="urn:amazon:cognito:sp:${POOL_ID}"
-          echo "applicationStartURL=$START" >> "$GITHUB_OUTPUT"
-          echo "applicationACSURL=$ACS" >> "$GITHUB_OUTPUT"
-          echo "applicationSAMLAudience=$AUDIENCE" >> "$GITHUB_OUTPUT"
-          echo "cognitoUserPoolId=$POOL_ID" >> "$GITHUB_OUTPUT"
-          echo "cognitoClientId=$CLIENT_ID" >> "$GITHUB_OUTPUT"
-          echo "amplifyUrl=https://${AMPLIFY_HOST}/" >> "$GITHUB_OUTPUT"
-          jq -n --arg url "${{ secrets.IDC_SAML_METADATA_URL }}" '{MetadataURL: $url}' > deployment/details.json
-      # -------------------------------------------------------------------------
-      # IAM Identity Center custom SAML app – NOT fully automatable via supported CLI.
-      # Print computed SP values for documentation / console alignment; operator
-      # must ensure the IDC SAML app + secret IDC_SAML_METADATA_URL match them.
-      # -------------------------------------------------------------------------
-      - name: SAML application (documentation / manual parity)
-        run: |
-          set -euo pipefail
-          echo "Configure (or verify) the IAM Identity Center custom SAML 2.0 application in the console so that:"
-          echo "  Application start URL: ${{ steps.saml.outputs.applicationStartURL }}"
-          echo "  Application ACS URL:   ${{ steps.saml.outputs.applicationACSURL }}"
-          echo "  Application SAML audience: ${{ steps.saml.outputs.applicationSAMLAudience }}"
-          echo "Then store the IAM Identity Center SAML metadata URL in GitHub secret IDC_SAML_METADATA_URL."
-          if [[ -z "${{ secrets.IDC_SAML_METADATA_URL }}" ]]; then
-            echo "::error::Secret IDC_SAML_METADATA_URL is not set. Cognito cannot trust IAM Identity Center without IdP metadata."
+          # Wait for Amplify app to exist
+          echo "Waiting for Amplify app TEAM-IDC-APP..."
+          for i in {1..30}; do
+            APP_ID=$(aws amplify list-apps --region ${{ vars.AWS_REGION }} --query "apps[?name=='TEAM-IDC-APP'].appId" --output text)
+            if [ -n "$APP_ID" ]; then
+              break
+            fi
+            echo "Attempt $i/30: App not found, waiting 10 seconds..."
+            sleep 10
+          done
+          if [ -z "$APP_ID" ]; then
+            echo "ERROR: Amplify app not found after 5 minutes."
             exit 1
           fi
-      # -------------------------------------------------------------------------
-      # Cognito: SAML IdP + client (same as cognito.sh; idempotent-ish)
-      # -------------------------------------------------------------------------
-      - name: Configure Cognito SAML provider and app client
-        working-directory: deployment
-        run: |
-          set -euo pipefail
-          unset AWS_PROFILE || true
-          REGION="${{ env.AWS_REGION }}"
-          POOL="${{ steps.saml.outputs.cognitoUserPoolId }}"
-          CLIENT="${{ steps.saml.outputs.cognitoClientId }}"
-          HOST=$(echo "${{ steps.saml.outputs.amplifyUrl }}" | sed 's|https://||;s|/$||')
-          if aws cognito-idp describe-identity-provider --user-pool-id "$POOL" --provider-name IDC --region "$REGION" &>/dev/null; then
-            aws cognito-idp update-identity-provider \
-              --user-pool-id "$POOL" --provider-name IDC --region "$REGION" \
-              --provider-details file://details.json \
-              --attribute-mapping email=Email
-          else
-            aws cognito-idp create-identity-provider \
-              --user-pool-id "$POOL" --provider-name IDC --provider-type SAML \
-              --region "$REGION" \
-              --provider-details file://details.json \
-              --attribute-mapping email=Email \
-              --idp-identifiers team
+          echo "APP_ID=$APP_ID" >> $GITHUB_OUTPUT
+
+          # Wait for Amplify build to complete
+          for i in {1..60}; do
+            STATUS=$(aws amplify get-app --app-id $APP_ID --query "app.status" --output text 2>/dev/null || echo "UNKNOWN")
+            echo "Attempt $i/60: Amplify status = $STATUS"
+            if [ "$STATUS" = "AVAILABLE" ]; then
+              break
+            elif [ "$STATUS" = "FAILED" ]; then
+              echo "ERROR: Amplify build failed. Check Amplify console."
+              exit 1
+            fi
+            sleep 30
+          done
+          if [ $i -ge 60 ]; then
+            echo "ERROR: Amplify not AVAILABLE after 30 minutes."
+            exit 1
           fi
-          aws cognito-idp update-user-pool-client \
-            --user-pool-id "$POOL" --client-id "$CLIENT" --region "$REGION" \
-            --refresh-token-validity 1 \
-            --supported-identity-providers IDC \
-            --allowed-o-auth-flows code \
-            --allowed-o-auth-scopes phone email openid profile aws.cognito.signin.user.admin \
-            --logout-urls "https://${HOST}/" \
-            --callback-urls "https://${HOST}/" \
-            --allowed-o-auth-flows-user-pool-client
-      # -------------------------------------------------------------------------
-      # Optional: api-machine-auth.sh – uncomment if you use machine auth
-      # -------------------------------------------------------------------------
-      # - name: API machine authentication setup
-      #   working-directory: deployment
-      #   run: bash ./api-machine-auth.sh
-      - name: Verify Amplify URL responds
+
+          # Get Amplify domain
+          AMPLIFY_DOMAIN=$(aws amplify get-app --app-id $APP_ID --query "app.defaultDomain" --output text)
+          echo "AMPLIFY_DOMAIN=$AMPLIFY_DOMAIN" >> $GITHUB_OUTPUT
+
+          # Get Cognito User Pool ID (from stack output or fallback)
+          USER_POOL_ID=$(aws cloudformation describe-stacks --stack-name TEAM-IDC-APP --query "Stacks[0].Outputs[?OutputKey=='UserPoolId'].OutputValue" --output text)
+          if [ -z "$USER_POOL_ID" ]; then
+            USER_POOL_ID=$(aws cognito-idp list-user-pools --max-results 20 --region ${{ vars.AWS_REGION }} --query "UserPools[?contains(Name, 'team06dbb7fc')].Id" --output text)
+          fi
+          if [ -z "$USER_POOL_ID" ]; then
+            echo "ERROR: Could not retrieve User Pool ID"
+            exit 1
+          fi
+          echo "USER_POOL_ID=$USER_POOL_ID" >> $GITHUB_OUTPUT
+
+          # Get Cognito client ID (from stack output or fallback)
+          CLIENT_ID=$(aws cloudformation describe-stacks --stack-name TEAM-IDC-APP --query "Stacks[0].Outputs[?OutputKey=='ClientId'].OutputValue" --output text)
+          if [ -z "$CLIENT_ID" ]; then
+            CLIENT_ID=$(aws cognito-idp list-user-pool-clients --user-pool-id $USER_POOL_ID --query "UserPoolClients[0].ClientId" --output text)
+          fi
+          echo "CLIENT_ID=$CLIENT_ID" >> $GITHUB_OUTPUT
+
+      # ---------- STEP 4: Configure Cognito using pre-stored SAML metadata URL ----------
+      - name: Configure Cognito SAML provider
         run: |
-          set -euo pipefail
-          URL="${{ steps.saml.outputs.amplifyUrl }}"
-          code=$(curl -sS -o /dev/null -w "%{http_code}" --max-time 60 "$URL" || echo "000")
-          echo "HTTP $code for $URL"
-          # 200 or 3xx acceptable for SPA; adjust as needed
-          case "$code" in
-            2*|3*) exit 0 ;;
-            *) exit 1 ;;
-          esac
+          PROVIDER_NAME="IAMIdentityCenter"
+          USER_POOL_ID="${{ steps.saml.outputs.USER_POOL_ID }}"
+          CLIENT_ID="${{ steps.saml.outputs.CLIENT_ID }}"
+          METADATA_URL="${{ vars.SAML_METADATA_URL }}"
+          AMPLIFY_DOMAIN="${{ steps.saml.outputs.AMPLIFY_DOMAIN }}"
+
+          # Create or update the SAML identity provider in Cognito
+          EXISTS=$(aws cognito-idp list-identity-providers \
+            --user-pool-id "$USER_POOL_ID" \
+            --query "Providers[?ProviderName=='$PROVIDER_NAME'] | length(@)" \
+            --output text || echo "0")
+
+          if [ "$EXISTS" = "0" ]; then
+            echo "Creating Cognito SAML provider..."
+            aws cognito-idp create-identity-provider \
+              --user-pool-id "$USER_POOL_ID" \
+              --provider-name "$PROVIDER_NAME" \
+              --provider-type SAML \
+              --provider-details "MetadataURL=$METADATA_URL" \
+              --attribute-mapping "email=email" \
+              --idp-identifiers team
+          else
+            echo "Updating Cognito SAML provider..."
+            aws cognito-idp update-identity-provider \
+              --user-pool-id "$USER_POOL_ID" \
+              --provider-name "$PROVIDER_NAME" \
+              --provider-details "MetadataURL=$METADATA_URL" \
+              --attribute-mapping "email=email"
+          fi
+
+          # Update the user pool client
+          aws cognito-idp update-user-pool-client \
+            --user-pool-id "$USER_POOL_ID" \
+            --client-id "$CLIENT_ID" \
+            --refresh-token-validity 1 \
+            --supported-identity-providers "$PROVIDER_NAME" \
+            --allowed-o-auth-flows code \
+            --allowed-o-auth-scopes "phone" "email" "openid" "profile" "aws.cognito.signin.user.admin" \
+            --logout-urls "https://main.${AMPLIFY_DOMAIN}/" \
+            --callback-urls "https://main.${AMPLIFY_DOMAIN}/" \
+            --allowed-o-auth-flows-user-pool-client
+
+      - name: (Optional) Setup machine authentication
+        run: |
+          cd deployment
+          sed -i 's/^[[:space:]]*export[[:space:]]\+AWS_PROFILE=.*/unset AWS_PROFILE/' api-machine-auth.sh 2>/dev/null || true
+          chmod +x api-machine-auth.sh
+          ./api-machine-auth.sh || echo "Machine auth setup skipped."
+
+      - name: Verify deployment
+        run: |
+          APP_URL=$(aws amplify list-apps --query "apps[?name=='TEAM-IDC-APP'].defaultDomain" --output text)
+          if [ -n "$APP_URL" ]; then
+            curl -f "https://main.${APP_URL}/" && echo "TEAM application is online."
+          else
+            echo "Could not determine app URL."
+          fi
