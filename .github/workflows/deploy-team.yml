@@ -70,11 +70,15 @@ jobs:
           pipx install git-remote-codecommit
           echo "$HOME/.local/bin" >> $GITHUB_PATH
 
-      - name: Update CodeCommit repository (force push)
+      - name: Update CodeCommit repository (force push with full history)
         run: |
           git config user.email "github-actions@github.com"
           git config user.name "GitHub Actions"
+          # Add or update the CodeCommit remote
           git remote add codecommit codecommit::${{ vars.AWS_REGION }}://team-idc-app || git remote set-url codecommit codecommit::${{ vars.AWS_REGION }}://team-idc-app
+          # Fetch the full remote history (convert shallow clone to deep)
+          git fetch --unshallow codecommit || git fetch codecommit
+          # Force push the local main branch to the remote main branch
           git push --force codecommit main
 
       - name: Patch deploy.sh (skip git commands, unset AWS_PROFILE)
