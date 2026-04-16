@@ -117,37 +117,35 @@ jobs:
       # ---------- STEP 3: Wait for Amplify and retrieve SAML parameters ----------
       - name: Wait for Amplify and retrieve SAML parameters
         id: saml
+        timeout-minutes: 20
         run: |
-          # Wait for Amplify app to exist
-          echo "Waiting for Amplify app TEAM-IDC-APP..."
-          for i in {1..30}; do
-            APP_ID=$(aws amplify list-apps --region ${{ vars.AWS_REGION }} --query "apps[?name=='TEAM-IDC-APP'].appId" --output text)
-            if [ -n "$APP_ID" ]; then
-              break
-            fi
-            echo "Attempt $i/30: App not found, waiting 10 seconds..."
-            sleep 10
-          done
+          # Get App ID from CloudFormation stack outputs (most reliable)
+          APP_ID=$(aws cloudformation describe-stacks --stack-name TEAM-IDC-APP --query "Stacks[0].Outputs[?OutputKey=='AppId'].OutputValue" --output text)
           if [ -z "$APP_ID" ]; then
-            echo "ERROR: Amplify app not found after 5 minutes."
+            echo "AppId not found in stack outputs, falling back to listing apps by name..."
+            APP_ID=$(aws amplify list-apps --region ${{ vars.AWS_REGION }} --query "apps[?name=='TEAM-IDC-APP'].appId" --output text)
+          fi
+          if [ -z "$APP_ID" ]; then
+            echo "ERROR: Could not retrieve Amplify App ID"
             exit 1
           fi
           echo "APP_ID=$APP_ID" >> $GITHUB_OUTPUT
 
-          # Wait for Amplify build to complete
+          # Wait for Amplify build to complete by checking the latest job for branch 'main'
           for i in {1..60}; do
-            STATUS=$(aws amplify get-app --app-id $APP_ID --query "app.status" --output text 2>/dev/null || echo "UNKNOWN")
-            echo "Attempt $i/60: Amplify status = $STATUS"
-            if [ "$STATUS" = "AVAILABLE" ]; then
+            JOB=$(aws amplify list-jobs --app-id $APP_ID --branch-name main --max-items 1 --region ${{ vars.AWS_REGION }} --query 'jobSummaries[0]' --output json 2>/dev/null || echo '{"status":"UNKNOWN"}')
+            STATUS=$(echo "$JOB" | jq -r '.status // "UNKNOWN"')
+            echo "Attempt $i/60: Amplify job status = $STATUS"
+            if [ "$STATUS" = "SUCCEED" ]; then
               break
-            elif [ "$STATUS" = "FAILED" ]; then
-              echo "ERROR: Amplify build failed. Check Amplify console."
+            elif [ "$STATUS" = "FAILED" ] || [ "$STATUS" = "CANCELLED" ]; then
+              echo "ERROR: Amplify build failed with status $STATUS"
               exit 1
             fi
             sleep 30
           done
           if [ $i -ge 60 ]; then
-            echo "ERROR: Amplify not AVAILABLE after 30 minutes."
+            echo "ERROR: Amplify build did not complete within 30 minutes."
             exit 1
           fi
 
