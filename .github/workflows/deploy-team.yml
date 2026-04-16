@@ -1,4 +1,4 @@
-name: Deploy TEAM Application (Automated)
+name: Deploy TEAM Application (Simplified)
 
 on:
   push:
@@ -17,12 +17,10 @@ env:
 jobs:
   deploy:
     runs-on: ubuntu-latest
-    timeout-minutes: 60
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
 
-      # ---------- STEP 1: Assume Role A (Management) for init.sh ----------
       - name: Configure AWS credentials (Role A)
         uses: aws-actions/configure-aws-credentials@v4
         with:
@@ -47,15 +45,14 @@ jobs:
           CACHE_TTL=604800
           EOF
 
-      - name: Run init.sh (delegated admin setup)
+      - name: Run init.sh
         run: |
           cd deployment
           chmod +x init.sh
           sed -i 's/^[[:space:]]*export[[:space:]]\+AWS_PROFILE=.*/unset AWS_PROFILE/' init.sh
           ./init.sh
 
-      # ---------- STEP 2: Assume Role B (TEAM account) for deployment ----------
-      - name: Assume Role B manually
+      - name: Assume Role B
         run: |
           CREDS=$(aws sts assume-role \
             --role-arn "${{ vars.TEAM_ROLE_B_ARN }}" \
@@ -67,39 +64,31 @@ jobs:
           echo "AWS_SESSION_TOKEN=$(echo $CREDS | jq -r .Credentials.SessionToken)" >> $GITHUB_ENV
           echo "AWS_REGION=${{ vars.AWS_REGION }}" >> $GITHUB_ENV
           echo "AWS_DEFAULT_REGION=${{ vars.AWS_REGION }}" >> $GITHUB_ENV
-          echo "Successfully assumed Role B"
-          aws sts get-caller-identity
 
       - name: Install git-remote-codecommit
         run: |
           pipx install git-remote-codecommit
           echo "$HOME/.local/bin" >> $GITHUB_PATH
 
-      - name: Delete existing CodeCommit repository (idempotency)
+      - name: Reset CodeCommit repository
         run: |
-          aws codecommit delete-repository --repository-name team-idc-app --region ${{ vars.AWS_REGION }} || echo "Repository not found, continuing."
-
-      - name: Create CodeCommit repository
-        run: |
-          aws codecommit create-repository --repository-name team-idc-app --region ${{ vars.AWS_REGION }} --repository-description "Temporary Elevated Access Management (TEAM) Application"
-
-      - name: Create fresh git repository and push to CodeCommit
-        run: |
+          aws codecommit delete-repository --repository-name team-idc-app --region ${{ vars.AWS_REGION }} || true
+          aws codecommit create-repository --repository-name team-idc-app --region ${{ vars.AWS_REGION }}
           rm -rf .git
           git init -b main
           git config user.email "github-actions@github.com"
           git config user.name "GitHub Actions"
           git add .
-          git commit -m "Initial commit for TEAM deployment"
+          git commit -m "Initial commit"
           git remote add origin codecommit::${{ vars.AWS_REGION }}://team-idc-app
           git push --force origin main
 
-      - name: Delete existing CloudFormation stack if in failed state
+      - name: Delete old CloudFormation stack (if exists)
         run: |
-          aws cloudformation delete-stack --stack-name TEAM-IDC-APP --region ${{ vars.AWS_REGION }} || echo "Stack does not exist or already deleted"
-          aws cloudformation wait stack-delete-complete --stack-name TEAM-IDC-APP --region ${{ vars.AWS_REGION }} || echo "No stack to wait for"
+          aws cloudformation delete-stack --stack-name TEAM-IDC-APP --region ${{ vars.AWS_REGION }} || true
+          aws cloudformation wait stack-delete-complete --stack-name TEAM-IDC-APP --region ${{ vars.AWS_REGION }} || true
 
-      - name: Patch deploy.sh to skip git commands and only deploy CloudFormation
+      - name: Patch deploy.sh
         run: |
           cd deployment
           sed -i 's/^[[:space:]]*export[[:space:]]\+AWS_PROFILE=.*/unset AWS_PROFILE/' deploy.sh
@@ -108,86 +97,25 @@ jobs:
           sed -i '/git remote add origin/ s/^/#/' deploy.sh
           sed -i '/git push origin main/ s/^/#/' deploy.sh
 
-      - name: Run deploy.sh (only CloudFormation deployment)
+      - name: Deploy CloudFormation stack
         run: |
           cd deployment
           chmod +x deploy.sh
           ./deploy.sh
 
-      # ---------- STEP 3: Wait for Amplify and retrieve SAML parameters ----------
-      - name: Wait for Amplify and retrieve SAML parameters
-        id: saml
-        timeout-minutes: 20
+      # ---------- Use pre‑stored SAML parameters ----------
+      - name: Configure Cognito SAML provider (using pre‑set variables)
         run: |
-          # Get App ID from CloudFormation stack outputs (most reliable)
-          APP_ID=$(aws cloudformation describe-stacks --stack-name TEAM-IDC-APP --query "Stacks[0].Outputs[?OutputKey=='AppId'].OutputValue" --output text)
-          if [ -z "$APP_ID" ]; then
-            echo "AppId not found in stack outputs, falling back to listing apps by name..."
-            APP_ID=$(aws amplify list-apps --region ${{ vars.AWS_REGION }} --query "apps[?name=='TEAM-IDC-APP'].appId" --output text)
-          fi
-          if [ -z "$APP_ID" ]; then
-            echo "ERROR: Could not retrieve Amplify App ID"
-            exit 1
-          fi
-          echo "APP_ID=$APP_ID" >> $GITHUB_OUTPUT
-
-          # Wait for Amplify build to complete by checking the latest job for branch 'main'
-          for i in {1..60}; do
-            JOB=$(aws amplify list-jobs --app-id $APP_ID --branch-name main --max-items 1 --region ${{ vars.AWS_REGION }} --query 'jobSummaries[0]' --output json 2>/dev/null || echo '{"status":"UNKNOWN"}')
-            STATUS=$(echo "$JOB" | jq -r '.status // "UNKNOWN"')
-            echo "Attempt $i/60: Amplify job status = $STATUS"
-            if [ "$STATUS" = "SUCCEED" ]; then
-              break
-            elif [ "$STATUS" = "FAILED" ] || [ "$STATUS" = "CANCELLED" ]; then
-              echo "ERROR: Amplify build failed with status $STATUS"
-              exit 1
-            fi
-            sleep 30
-          done
-          if [ $i -ge 60 ]; then
-            echo "ERROR: Amplify build did not complete within 30 minutes."
-            exit 1
-          fi
-
-          # Get Amplify domain
-          AMPLIFY_DOMAIN=$(aws amplify get-app --app-id $APP_ID --query "app.defaultDomain" --output text)
-          echo "AMPLIFY_DOMAIN=$AMPLIFY_DOMAIN" >> $GITHUB_OUTPUT
-
-          # Get Cognito User Pool ID (from stack output or fallback)
+          # Get Cognito details from stack outputs
           USER_POOL_ID=$(aws cloudformation describe-stacks --stack-name TEAM-IDC-APP --query "Stacks[0].Outputs[?OutputKey=='UserPoolId'].OutputValue" --output text)
-          if [ -z "$USER_POOL_ID" ]; then
-            USER_POOL_ID=$(aws cognito-idp list-user-pools --max-results 20 --region ${{ vars.AWS_REGION }} --query "UserPools[?contains(Name, 'team06dbb7fc')].Id" --output text)
-          fi
-          if [ -z "$USER_POOL_ID" ]; then
-            echo "ERROR: Could not retrieve User Pool ID"
-            exit 1
-          fi
-          echo "USER_POOL_ID=$USER_POOL_ID" >> $GITHUB_OUTPUT
-
-          # Get Cognito client ID (from stack output or fallback)
           CLIENT_ID=$(aws cloudformation describe-stacks --stack-name TEAM-IDC-APP --query "Stacks[0].Outputs[?OutputKey=='ClientId'].OutputValue" --output text)
-          if [ -z "$CLIENT_ID" ]; then
-            CLIENT_ID=$(aws cognito-idp list-user-pool-clients --user-pool-id $USER_POOL_ID --query "UserPoolClients[0].ClientId" --output text)
-          fi
-          echo "CLIENT_ID=$CLIENT_ID" >> $GITHUB_OUTPUT
+          AMPLIFY_DOMAIN=$(aws cloudformation describe-stacks --stack-name TEAM-IDC-APP --query "Stacks[0].Outputs[?OutputKey=='DefaultDomain'].OutputValue" --output text)
 
-      # ---------- STEP 4: Configure Cognito using pre-stored SAML metadata URL ----------
-      - name: Configure Cognito SAML provider
-        run: |
-          PROVIDER_NAME="IAMIdentityCenter"
-          USER_POOL_ID="${{ steps.saml.outputs.USER_POOL_ID }}"
-          CLIENT_ID="${{ steps.saml.outputs.CLIENT_ID }}"
+          # Create or update the SAML identity provider in Cognito using pre‑stored metadata URL
           METADATA_URL="${{ vars.SAML_METADATA_URL }}"
-          AMPLIFY_DOMAIN="${{ steps.saml.outputs.AMPLIFY_DOMAIN }}"
-
-          # Create or update the SAML identity provider in Cognito
-          EXISTS=$(aws cognito-idp list-identity-providers \
-            --user-pool-id "$USER_POOL_ID" \
-            --query "Providers[?ProviderName=='$PROVIDER_NAME'] | length(@)" \
-            --output text || echo "0")
-
+          PROVIDER_NAME="IAMIdentityCenter"
+          EXISTS=$(aws cognito-idp list-identity-providers --user-pool-id "$USER_POOL_ID" --query "Providers[?ProviderName=='$PROVIDER_NAME'] | length(@)" --output text || echo "0")
           if [ "$EXISTS" = "0" ]; then
-            echo "Creating Cognito SAML provider..."
             aws cognito-idp create-identity-provider \
               --user-pool-id "$USER_POOL_ID" \
               --provider-name "$PROVIDER_NAME" \
@@ -196,7 +124,6 @@ jobs:
               --attribute-mapping "email=email" \
               --idp-identifiers team
           else
-            echo "Updating Cognito SAML provider..."
             aws cognito-idp update-identity-provider \
               --user-pool-id "$USER_POOL_ID" \
               --provider-name "$PROVIDER_NAME" \
@@ -204,7 +131,7 @@ jobs:
               --attribute-mapping "email=email"
           fi
 
-          # Update the user pool client
+          # Update user pool client
           aws cognito-idp update-user-pool-client \
             --user-pool-id "$USER_POOL_ID" \
             --client-id "$CLIENT_ID" \
@@ -215,13 +142,6 @@ jobs:
             --logout-urls "https://main.${AMPLIFY_DOMAIN}/" \
             --callback-urls "https://main.${AMPLIFY_DOMAIN}/" \
             --allowed-o-auth-flows-user-pool-client
-
-      - name: (Optional) Setup machine authentication
-        run: |
-          cd deployment
-          sed -i 's/^[[:space:]]*export[[:space:]]\+AWS_PROFILE=.*/unset AWS_PROFILE/' api-machine-auth.sh 2>/dev/null || true
-          chmod +x api-machine-auth.sh
-          ./api-machine-auth.sh || echo "Machine auth setup skipped."
 
       - name: Verify deployment
         run: |
