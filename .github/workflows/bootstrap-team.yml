@@ -1,0 +1,144 @@
+name: Bootstrap TEAM Application (First Deployment)
+
+on:
+  workflow_dispatch:
+
+permissions:
+  id-token: write
+  contents: read
+
+env:
+  AWS_REGION: ${{ vars.AWS_REGION }}
+  MANAGEMENT_ACCOUNT: ${{ vars.MANAGEMENT_ACCOUNT }}
+  TEAM_ACCOUNT: ${{ vars.TEAM_ACCOUNT }}
+
+jobs:
+  bootstrap:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      # ---------- Role A (management) for init.sh ----------
+      - name: Configure AWS credentials (Role A)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::${{ vars.MANAGEMENT_ACCOUNT }}:role/GitHubActions-TEAM-RoleA
+          aws-region: ${{ vars.AWS_REGION }}
+
+      - name: Generate parameters.sh
+        run: |
+          cd deployment
+          cat > parameters.sh <<EOF
+          IDC_LOGIN_URL="${{ vars.IDC_LOGIN_URL }}"
+          REGION="${{ vars.AWS_REGION }}"
+          TEAM_ACCOUNT="${{ vars.TEAM_ACCOUNT }}"
+          ORG_MASTER_PROFILE=""
+          TEAM_ACCOUNT_PROFILE=""
+          TEAM_ADMIN_GROUP="${{ vars.TEAM_ADMIN_GROUP }}"
+          TEAM_AUDITOR_GROUP="${{ vars.TEAM_AUDITOR_GROUP }}"
+          TAGS="${{ vars.TAGS }}"
+          CLOUDTRAIL_AUDIT_LOGS="${{ vars.CLOUDTRAIL_AUDIT_LOGS }}"
+          UI_DOMAIN="${{ vars.UI_DOMAIN }}"
+          SECRET_NAME="${{ vars.SECRET_NAME }}"
+          CACHE_TTL=604800
+          EOF
+
+      - name: Run init.sh (delegated admin setup)
+        run: |
+          cd deployment
+          chmod +x init.sh
+          sed -i 's/^[[:space:]]*export[[:space:]]\+AWS_PROFILE=.*/unset AWS_PROFILE/' init.sh
+          ./init.sh
+
+      # ---------- Assume Role B (TEAM account) ----------
+      - name: Assume Role B
+        run: |
+          CREDS=$(aws sts assume-role \
+            --role-arn "${{ vars.TEAM_ROLE_B_ARN }}" \
+            --role-session-name "GitHubActionsRoleB" \
+            --duration-seconds 3600 \
+            --output json)
+          echo "AWS_ACCESS_KEY_ID=$(echo $CREDS | jq -r .Credentials.AccessKeyId)" >> $GITHUB_ENV
+          echo "AWS_SECRET_ACCESS_KEY=$(echo $CREDS | jq -r .Credentials.SecretAccessKey)" >> $GITHUB_ENV
+          echo "AWS_SESSION_TOKEN=$(echo $CREDS | jq -r .Credentials.SessionToken)" >> $GITHUB_ENV
+          echo "AWS_REGION=${{ vars.AWS_REGION }}" >> $GITHUB_ENV
+          echo "AWS_DEFAULT_REGION=${{ vars.AWS_REGION }}" >> $GITHUB_ENV
+
+      - name: Install git-remote-codecommit
+        run: |
+          pipx install git-remote-codecommit
+          echo "$HOME/.local/bin" >> $GITHUB_PATH
+
+      - name: Delete existing CodeCommit repository (if any)
+        run: |
+          aws codecommit delete-repository --repository-name team-idc-app --region ${{ vars.AWS_REGION }} || true
+
+      - name: Create CodeCommit repository
+        run: |
+          aws codecommit create-repository --repository-name team-idc-app --region ${{ vars.AWS_REGION }}
+
+      - name: Create fresh git repository and push to CodeCommit
+        run: |
+          rm -rf .git
+          git init -b main
+          git config user.email "github-actions@github.com"
+          git config user.name "GitHub Actions"
+          git add .
+          git commit -m "Initial commit for TEAM deployment"
+          git remote add origin codecommit::${{ vars.AWS_REGION }}://team-idc-app
+          git push --force origin main
+
+      - name: Delete existing CloudFormation stack (if any)
+        run: |
+          aws cloudformation delete-stack --stack-name TEAM-IDC-APP --region ${{ vars.AWS_REGION }} || true
+          aws cloudformation wait stack-delete-complete --stack-name TEAM-IDC-APP --region ${{ vars.AWS_REGION }} || true
+
+      - name: Patch deploy.sh (skip git commands, unset AWS_PROFILE)
+        run: |
+          cd deployment
+          sed -i 's/^[[:space:]]*export[[:space:]]\+AWS_PROFILE=.*/unset AWS_PROFILE/' deploy.sh
+          sed -i '/aws codecommit create-repository/ s/^/#/' deploy.sh
+          sed -i '/git remote remove origin/ s/^/#/' deploy.sh
+          sed -i '/git remote add origin/ s/^/#/' deploy.sh
+          sed -i '/git push origin main/ s/^/#/' deploy.sh
+
+      - name: Run deploy.sh (creates CloudFormation stack)
+        run: |
+          cd deployment
+          chmod +x deploy.sh
+          ./deploy.sh
+
+      - name: Wait for CloudFormation stack to complete
+        run: |
+          echo "Waiting for stack TEAM-IDC-APP to reach CREATE_COMPLETE state..."
+          aws cloudformation wait stack-create-complete --stack-name TEAM-IDC-APP --region ${{ vars.AWS_REGION }}
+          echo "Stack creation completed."
+
+      - name: Retrieve and print SAML URLs (for manual setup)
+        run: |
+          USER_POOL_ID=$(aws cloudformation describe-stacks --stack-name TEAM-IDC-APP --query "Stacks[0].Outputs[?OutputKey=='UserPoolId'].OutputValue" --output text)
+          AMPLIFY_DOMAIN=$(aws cloudformation describe-stacks --stack-name TEAM-IDC-APP --query "Stacks[0].Outputs[?OutputKey=='DefaultDomain'].OutputValue" --output text)
+          CLIENT_ID=$(aws cognito-idp list-user-pool-clients --user-pool-id "$USER_POOL_ID" --query "UserPoolClients[0].ClientId" --output text)
+
+          COGNITO_DOMAIN="${USER_POOL_ID}.auth.${{ vars.AWS_REGION }}.amazoncognito.com"
+          START_URL="https://${COGNITO_DOMAIN}/authorize?client_id=${CLIENT_ID}&response_type=code&scope=aws.cognito.signin.user.admin+email+openid+phone+profile&redirect_uri=https://main.${AMPLIFY_DOMAIN}/&idp_identifier=team"
+          ACS_URL="https://${COGNITO_DOMAIN}/saml2/idpresponse"
+          AUDIENCE="urn:amazon:cognito:sp:${USER_POOL_ID}"
+
+          echo "================================================"
+          echo "Add these values as GitHub variables:"
+          echo "SAML_START_URL=$START_URL"
+          echo "SAML_ACS_URL=$ACS_URL"
+          echo "SAML_AUDIENCE=$AUDIENCE"
+          echo "================================================"
+          echo "Also create the SAML app in IAM Identity Center using these three URLs,"
+          echo "then store its metadata URL as SAML_METADATA_URL."
+          echo "================================================"
+
+      - name: Verify Amplify app is reachable
+        run: |
+          APP_URL=$(aws amplify list-apps --query "apps[?name=='TEAM-IDC-APP'].defaultDomain" --output text)
+          if [ -n "$APP_URL" ]; then
+            curl -f "https://main.${APP_URL}/" && echo "TEAM application is online."
+          fi
