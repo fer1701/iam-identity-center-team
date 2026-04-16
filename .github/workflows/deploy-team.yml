@@ -70,12 +70,23 @@ jobs:
           pipx install git-remote-codecommit
           echo "$HOME/.local/bin" >> $GITHUB_PATH
 
-      - name: Update CodeCommit repository (push latest code)
+      - name: Update CodeCommit repository (clone, copy, commit, push)
         run: |
           git config user.email "github-actions@github.com"
           git config user.name "GitHub Actions"
-          git remote add origin codecommit::${{ vars.AWS_REGION }}://team-idc-app || git remote set-url origin codecommit::${{ vars.AWS_REGION }}://team-idc-app
-          git push --force origin main
+          # Clone the existing CodeCommit repository
+          git clone codecommit::${{ vars.AWS_REGION }}://team-idc-app team-idc-app-temp
+          cd team-idc-app-temp
+          # Remove all files except .git
+          find . -maxdepth 1 ! -name '.git' ! -name '.' -exec rm -rf {} \;
+          # Copy new files from the GitHub workspace (the checkout)
+          cp -r ../* ./
+          # Stage all changes
+          git add .
+          # Commit (if no changes, the command will exit 0)
+          git commit -m "Update TEAM application [skip ci]" || echo "No changes to commit"
+          # Push to main branch
+          git push origin main
 
       - name: Patch deploy.sh (skip git commands, unset AWS_PROFILE)
         run: |
