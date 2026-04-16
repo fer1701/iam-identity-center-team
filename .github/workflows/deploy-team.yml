@@ -103,6 +103,12 @@ jobs:
           chmod +x deploy.sh
           ./deploy.sh
 
+      - name: Wait for CloudFormation stack to complete
+        run: |
+          echo "Waiting for stack TEAM-IDC-APP to reach CREATE_COMPLETE state..."
+          aws cloudformation wait stack-create-complete --stack-name TEAM-IDC-APP --region ${{ vars.AWS_REGION }}
+          echo "Stack creation completed."
+
       # ---------- Use pre‑stored SAML parameters ----------
       - name: Configure Cognito SAML provider (using pre‑set variables)
         run: |
@@ -110,6 +116,12 @@ jobs:
           USER_POOL_ID=$(aws cloudformation describe-stacks --stack-name TEAM-IDC-APP --query "Stacks[0].Outputs[?OutputKey=='UserPoolId'].OutputValue" --output text)
           CLIENT_ID=$(aws cloudformation describe-stacks --stack-name TEAM-IDC-APP --query "Stacks[0].Outputs[?OutputKey=='ClientId'].OutputValue" --output text)
           AMPLIFY_DOMAIN=$(aws cloudformation describe-stacks --stack-name TEAM-IDC-APP --query "Stacks[0].Outputs[?OutputKey=='DefaultDomain'].OutputValue" --output text)
+          # Validate that values are not empty
+          if [ -z "$USER_POOL_ID" ] || [ -z "$CLIENT_ID" ] || [ -z "$AMPLIFY_DOMAIN" ]; then
+             echo "ERROR: Could not retrieve Cognito details from stack outputs"
+             exit 1
+          fi
+
 
           # Create or update the SAML identity provider in Cognito using pre‑stored metadata URL
           METADATA_URL="${{ vars.SAML_METADATA_URL }}"
