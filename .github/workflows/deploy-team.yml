@@ -3,6 +3,8 @@ name: Deploy TEAM Application (Simplified)
 on:
   push:
     branches: [ "main" ]
+    paths-ignore:
+      - '.github/workflows/bootstrap-team.yml'
   workflow_dispatch:
 
 permissions:
