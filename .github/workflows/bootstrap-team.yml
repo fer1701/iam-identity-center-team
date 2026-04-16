@@ -115,14 +115,41 @@ jobs:
           aws cloudformation wait stack-create-complete --stack-name TEAM-IDC-APP --region ${{ vars.AWS_REGION }}
           echo "Stack creation completed."
 
+      # ---------- Retrieve SAML URLs using Cognito API (no stack outputs) ----------
       - name: Retrieve and print SAML URLs (for manual setup)
         run: |
-          USER_POOL_ID=$(aws cloudformation describe-stacks --stack-name TEAM-IDC-APP --query "Stacks[0].Outputs[?OutputKey=='UserPoolId'].OutputValue" --output text)
-          AMPLIFY_DOMAIN=$(aws cloudformation describe-stacks --stack-name TEAM-IDC-APP --query "Stacks[0].Outputs[?OutputKey=='DefaultDomain'].OutputValue" --output text)
-          CLIENT_ID=$(aws cognito-idp list-user-pool-clients --user-pool-id "$USER_POOL_ID" --query "UserPoolClients[0].ClientId" --output text)
+          # Get User Pool ID by name pattern (team06dbb7fc)
+          USER_POOL_ID=$(aws cognito-idp list-user-pools --max-results 20 --region ${{ vars.AWS_REGION }} --query "UserPools[?contains(Name, 'team06dbb7fc')].Id" --output text)
+          if [ -z "$USER_POOL_ID" ]; then
+            echo "ERROR: Could not find Cognito User Pool"
+            exit 1
+          fi
+          echo "UserPoolId: $USER_POOL_ID"
 
+          # Get the web client ID (name contains 'clientWeb')
+          CLIENT_ID=$(aws cognito-idp list-user-pool-clients --user-pool-id "$USER_POOL_ID" --region ${{ vars.AWS_REGION }} --query "UserPoolClients[?contains(ClientName, 'clientWeb')].ClientId" --output text)
+          if [ -z "$CLIENT_ID" ]; then
+            # Fallback to first client
+            CLIENT_ID=$(aws cognito-idp list-user-pool-clients --user-pool-id "$USER_POOL_ID" --region ${{ vars.AWS_REGION }} --query "UserPoolClients[0].ClientId" --output text)
+          fi
+          if [ -z "$CLIENT_ID" ]; then
+            echo "ERROR: Could not find Cognito App Client"
+            exit 1
+          fi
+          echo "ClientId: $CLIENT_ID"
+
+          # Get Amplify domain from stack output
+          AMPLIFY_DOMAIN=$(aws cloudformation describe-stacks --stack-name TEAM-IDC-APP --query "Stacks[0].Outputs[?OutputKey=='DefaultDomain'].OutputValue" --output text)
+          if [ -z "$AMPLIFY_DOMAIN" ]; then
+            echo "ERROR: Could not retrieve Amplify domain"
+            exit 1
+          fi
+          echo "Amplify domain: $AMPLIFY_DOMAIN"
+
+          # Build SAML URLs
           COGNITO_DOMAIN="${USER_POOL_ID}.auth.${{ vars.AWS_REGION }}.amazoncognito.com"
-          START_URL="https://${COGNITO_DOMAIN}/authorize?client_id=${CLIENT_ID}&response_type=code&scope=aws.cognito.signin.user.admin+email+openid+phone+profile&redirect_uri=https://main.${AMPLIFY_DOMAIN}/&idp_identifier=team"
+          REDIRECT_URI="https://main.${AMPLIFY_DOMAIN}/"
+          START_URL="https://${COGNITO_DOMAIN}/authorize?client_id=${CLIENT_ID}&response_type=code&scope=aws.cognito.signin.user.admin+email+openid+phone+profile&redirect_uri=${REDIRECT_URI}&idp_identifier=team"
           ACS_URL="https://${COGNITO_DOMAIN}/saml2/idpresponse"
           AUDIENCE="urn:amazon:cognito:sp:${USER_POOL_ID}"
 
