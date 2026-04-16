@@ -94,6 +94,14 @@ jobs:
           aws cloudformation delete-stack --stack-name TEAM-IDC-APP --region ${{ vars.AWS_REGION }} || true
           aws cloudformation wait stack-delete-complete --stack-name TEAM-IDC-APP --region ${{ vars.AWS_REGION }} || true
 
+
+      - name: Delete all leftover Amplify nested stacks
+        run: |
+          for stack in $(aws cloudformation list-stacks --stack-status-filter CREATE_COMPLETE UPDATE_COMPLETE DELETE_FAILED ROLLBACK_COMPLETE CREATE_FAILED UPDATE_ROLLBACK_COMPLETE --region ${{ vars.AWS_REGION }} --query "StackSummaries[?contains(StackName, 'amplify-teamidcapp')].StackName" --output text); do
+            aws cloudformation delete-stack --stack-name $stack --region ${{ vars.AWS_REGION }} || true
+          done
+          
+
       - name: Patch deploy.sh (skip git commands, unset AWS_PROFILE)
         run: |
           cd deployment
