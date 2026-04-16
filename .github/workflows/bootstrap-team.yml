@@ -19,7 +19,6 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
 
-      # ---------- Role A (management) for init.sh ----------
       - name: Configure AWS credentials (Role A)
         uses: aws-actions/configure-aws-credentials@v4
         with:
@@ -44,14 +43,13 @@ jobs:
           CACHE_TTL=604800
           EOF
 
-      - name: Run init.sh (delegated admin setup)
+      - name: Run init.sh
         run: |
           cd deployment
           chmod +x init.sh
           sed -i 's/^[[:space:]]*export[[:space:]]\+AWS_PROFILE=.*/unset AWS_PROFILE/' init.sh
           ./init.sh
 
-      # ---------- Assume Role B (TEAM account) ----------
       - name: Assume Role B
         run: |
           CREDS=$(aws sts assume-role \
@@ -94,15 +92,7 @@ jobs:
           aws cloudformation delete-stack --stack-name TEAM-IDC-APP --region ${{ vars.AWS_REGION }} || true
           aws cloudformation wait stack-delete-complete --stack-name TEAM-IDC-APP --region ${{ vars.AWS_REGION }} || true
 
-
-      - name: Delete all leftover Amplify nested stacks
-        run: |
-          for stack in $(aws cloudformation list-stacks --stack-status-filter CREATE_COMPLETE UPDATE_COMPLETE DELETE_FAILED ROLLBACK_COMPLETE CREATE_FAILED UPDATE_ROLLBACK_COMPLETE --region ${{ vars.AWS_REGION }} --query "StackSummaries[?contains(StackName, 'amplify-teamidcapp')].StackName" --output text); do
-            aws cloudformation delete-stack --stack-name $stack --region ${{ vars.AWS_REGION }} || true
-          done
-          
-
-      - name: Patch deploy.sh (skip git commands, unset AWS_PROFILE)
+      - name: Patch deploy.sh
         run: |
           cd deployment
           sed -i 's/^[[:space:]]*export[[:space:]]\+AWS_PROFILE=.*/unset AWS_PROFILE/' deploy.sh
@@ -119,40 +109,55 @@ jobs:
 
       - name: Wait for CloudFormation stack to complete
         run: |
-          echo "Waiting for stack TEAM-IDC-APP to reach CREATE_COMPLETE state..."
+          echo "Waiting for main stack..."
           aws cloudformation wait stack-create-complete --stack-name TEAM-IDC-APP --region ${{ vars.AWS_REGION }}
-          echo "Stack creation completed."
+          echo "Main stack created."
 
-      # ---------- Retrieve SAML URLs using Cognito API (no stack outputs) ----------
-      - name: Retrieve and print SAML URLs (for manual setup)
+      - name: Wait for Amplify build to succeed
         run: |
-          # Get User Pool ID by name pattern (team06dbb7fc)
-          USER_POOL_ID=$(aws cognito-idp list-user-pools --max-results 20 --region ${{ vars.AWS_REGION }} --query "UserPools[?contains(Name, 'team06dbb7fc')].Id" --output text)
-          if [ -z "$USER_POOL_ID" ]; then
-            echo "ERROR: Could not find Cognito User Pool"
-            exit 1
+          APP_ID=$(aws cloudformation describe-stacks --stack-name TEAM-IDC-APP --query "Stacks[0].Outputs[?OutputKey=='AppId'].OutputValue" --output text)
+          if [ -z "$APP_ID" ]; then
+            echo "AppId not found, falling back to listing apps..."
+            APP_ID=$(aws amplify list-apps --region ${{ vars.AWS_REGION }} --query "apps[?name=='TEAM-IDC-APP'].appId" --output text)
           fi
-          echo "UserPoolId: $USER_POOL_ID"
+          echo "Amplify App ID: $APP_ID"
+          for i in {1..60}; do
+            JOB=$(aws amplify list-jobs --app-id $APP_ID --branch-name main --max-items 1 --region ${{ vars.AWS_REGION }} --query 'jobSummaries[0]' --output json)
+            STATUS=$(echo "$JOB" | jq -r '.status // "UNKNOWN"')
+            echo "Attempt $i/60: Amplify build status = $STATUS"
+            if [ "$STATUS" = "SUCCEED" ]; then
+              break
+            elif [ "$STATUS" = "FAILED" ] || [ "$STATUS" = "CANCELLED" ]; then
+              echo "Amplify build failed."
+              exit 1
+            fi
+            sleep 30
+          done
 
-          # Get the web client ID (name contains 'clientWeb')
-          CLIENT_ID=$(aws cognito-idp list-user-pool-clients --user-pool-id "$USER_POOL_ID" --region ${{ vars.AWS_REGION }} --query "UserPoolClients[?contains(ClientName, 'clientWeb')].ClientId" --output text)
-          if [ -z "$CLIENT_ID" ]; then
-            # Fallback to first client
-            CLIENT_ID=$(aws cognito-idp list-user-pool-clients --user-pool-id "$USER_POOL_ID" --region ${{ vars.AWS_REGION }} --query "UserPoolClients[0].ClientId" --output text)
-          fi
-          if [ -z "$CLIENT_ID" ]; then
-            echo "ERROR: Could not find Cognito App Client"
-            exit 1
-          fi
-          echo "ClientId: $CLIENT_ID"
-
+      - name: Retrieve and print SAML URLs
+        run: |
           # Get Amplify domain from stack output
           AMPLIFY_DOMAIN=$(aws cloudformation describe-stacks --stack-name TEAM-IDC-APP --query "Stacks[0].Outputs[?OutputKey=='DefaultDomain'].OutputValue" --output text)
           if [ -z "$AMPLIFY_DOMAIN" ]; then
-            echo "ERROR: Could not retrieve Amplify domain"
-            exit 1
+            APP_ID=$(aws amplify list-apps --query "apps[?name=='TEAM-IDC-APP'].appId" --output text)
+            AMPLIFY_DOMAIN=$(aws amplify get-app --app-id $APP_ID --query "app.defaultDomain" --output text)
           fi
           echo "Amplify domain: $AMPLIFY_DOMAIN"
+
+          # Get the most recently created user pool (should be the TEAM one)
+          USER_POOL_ID=$(aws cognito-idp list-user-pools --max-results 10 --region ${{ vars.AWS_REGION }} --query "sort_by(UserPools, &CreationDate)[-1].Id" --output text)
+          if [ -z "$USER_POOL_ID" ]; then
+            echo "ERROR: No user pools found"
+            exit 1
+          fi
+          echo "User Pool ID: $USER_POOL_ID"
+
+          # Get the client ID for the web client (look for name containing 'clientWeb')
+          CLIENT_ID=$(aws cognito-idp list-user-pool-clients --user-pool-id "$USER_POOL_ID" --region ${{ vars.AWS_REGION }} --query "UserPoolClients[?contains(ClientName, 'clientWeb')].ClientId" --output text)
+          if [ -z "$CLIENT_ID" ]; then
+            CLIENT_ID=$(aws cognito-idp list-user-pool-clients --user-pool-id "$USER_POOL_ID" --region ${{ vars.AWS_REGION }} --query "UserPoolClients[0].ClientId" --output text)
+          fi
+          echo "Client ID: $CLIENT_ID"
 
           # Build SAML URLs
           COGNITO_DOMAIN="${USER_POOL_ID}.auth.${{ vars.AWS_REGION }}.amazoncognito.com"
@@ -170,10 +175,3 @@ jobs:
           echo "Also create the SAML app in IAM Identity Center using these three URLs,"
           echo "then store its metadata URL as SAML_METADATA_URL."
           echo "================================================"
-
-      - name: Verify Amplify app is reachable
-        run: |
-          APP_URL=$(aws amplify list-apps --query "apps[?name=='TEAM-IDC-APP'].defaultDomain" --output text)
-          if [ -n "$APP_URL" ]; then
-            curl -f "https://main.${APP_URL}/" && echo "TEAM application is online."
-          fi
