@@ -3,6 +3,10 @@ name: Update TEAM Application (Production)
 on:
   push:
     branches: [ "main" ]
+    paths-ignore:
+      - '.github/workflows/bootstrap-team.yml'
+      - 'README.md'
+      - 'docs/**'
   workflow_dispatch:
 
 permissions:
@@ -20,7 +24,10 @@ jobs:
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0   # full history, not shallow
 
+      # ---------- Role A (management) for init.sh ----------
       - name: Configure AWS credentials (Role A)
         uses: aws-actions/configure-aws-credentials@v4
         with:
@@ -45,13 +52,14 @@ jobs:
           CACHE_TTL=604800
           EOF
 
-      - name: Run init.sh (delegated admin setup)
+      - name: Run init.sh (delegated admin setup – idempotent)
         run: |
           cd deployment
           chmod +x init.sh
           sed -i 's/^[[:space:]]*export[[:space:]]\+AWS_PROFILE=.*/unset AWS_PROFILE/' init.sh
           ./init.sh
 
+      # ---------- Assume Role B (TEAM account) ----------
       - name: Assume Role B
         run: |
           CREDS=$(aws sts assume-role \
@@ -70,27 +78,25 @@ jobs:
           pipx install git-remote-codecommit
           echo "$HOME/.local/bin" >> $GITHUB_PATH
 
-      - name: Update CodeCommit repository (clone, replace, commit, push)
+      # ---------- Sync CodeCommit repository with GitHub fork ----------
+      - name: Sync CodeCommit repository (reset --hard)
         run: |
           git config user.email "github-actions@github.com"
           git config user.name "GitHub Actions"
-          # Clone the existing CodeCommit repository
-          git clone codecommit::${{ vars.AWS_REGION }}://team-idc-app team-idc-app-temp
-          cd team-idc-app-temp
-          # Remove all files except .git
-          find . -maxdepth 1 ! -name '.git' ! -name '.' -exec rm -rf {} \;
-          # Copy new files from the GitHub workspace (parent directory), excluding the temp directory
-          for file in $(ls -A .. | grep -v 'team-idc-app-temp'); do
-            cp -r "../$file" ./
-          done
-          # Stage all changes
-          git add .
-          # Commit if there are changes
-          git commit -m "Update TEAM application [skip ci]" || echo "No changes to commit"
-          # Push to origin (which is the CodeCommit remote)
-          git push origin main
+          # Clone the existing CodeCommit repository (full history)
+          git clone codecommit::${{ vars.AWS_REGION }}://team-idc-app team-idc-app-codecommit
+          cd team-idc-app-codecommit
+          # Add the GitHub repository as a remote
+          git remote add github https://github.com/${{ github.repository }}.git
+          # Fetch the latest from GitHub main branch
+          git fetch github main
+          # Reset the local branch to exactly match GitHub main (overwrites CodeCommit history)
+          git reset --hard github/main
+          # Push the updated code back to CodeCommit (force push)
+          git push --force origin main
 
-      - name: Patch deploy.sh (skip git commands, unset AWS_PROFILE)
+      # ---------- Patch deploy.sh (skip git commands, unset AWS_PROFILE) ----------
+      - name: Patch deploy.sh
         run: |
           cd deployment
           sed -i 's/^[[:space:]]*export[[:space:]]\+AWS_PROFILE=.*/unset AWS_PROFILE/' deploy.sh
@@ -99,23 +105,30 @@ jobs:
           sed -i '/git remote add origin/ s/^/#/' deploy.sh
           sed -i '/git push origin main/ s/^/#/' deploy.sh
 
+      # ---------- Update CloudFormation stack (in‑place) ----------
       - name: Update CloudFormation stack (in‑place)
         run: |
           cd deployment
           chmod +x deploy.sh
           ./deploy.sh
 
-      - name: Configure Cognito SAML provider (using pre‑stored metadata URL)
+      # ---------- Configure Cognito SAML provider (using pre‑stored metadata URL) ----------
+      - name: Configure Cognito SAML provider
         run: |
-          # Stack already exists, so outputs are available
+          # Retrieve Cognito details from the existing stack
           USER_POOL_ID=$(aws cloudformation describe-stacks --stack-name TEAM-IDC-APP --query "Stacks[0].Outputs[?OutputKey=='UserPoolId'].OutputValue" --output text)
+          if [ -z "$USER_POOL_ID" ]; then
+            USER_POOL_ID=$(aws cognito-idp list-user-pools --max-results 20 --region ${{ vars.AWS_REGION }} --query "UserPools[?contains(Name, 'team06dbb7fc')].Id" --output text)
+          fi
           CLIENT_ID=$(aws cognito-idp list-user-pool-clients --user-pool-id "$USER_POOL_ID" --query "UserPoolClients[0].ClientId" --output text)
           AMPLIFY_DOMAIN=$(aws cloudformation describe-stacks --stack-name TEAM-IDC-APP --query "Stacks[0].Outputs[?OutputKey=='DefaultDomain'].OutputValue" --output text)
-          METADATA_URL="${{ vars.SAML_METADATA_URL }}"
 
+          METADATA_URL="${{ vars.SAML_METADATA_URL }}"
           PROVIDER_NAME="IAMIdentityCenter"
+
           EXISTS=$(aws cognito-idp list-identity-providers --user-pool-id "$USER_POOL_ID" --query "Providers[?ProviderName=='$PROVIDER_NAME'] | length(@)" --output text || echo "0")
           if [ "$EXISTS" = "0" ]; then
+            echo "Creating Cognito SAML provider..."
             aws cognito-idp create-identity-provider \
               --user-pool-id "$USER_POOL_ID" \
               --provider-name "$PROVIDER_NAME" \
@@ -124,6 +137,7 @@ jobs:
               --attribute-mapping "email=email" \
               --idp-identifiers team
           else
+            echo "Updating Cognito SAML provider..."
             aws cognito-idp update-identity-provider \
               --user-pool-id "$USER_POOL_ID" \
               --provider-name "$PROVIDER_NAME" \
@@ -141,6 +155,13 @@ jobs:
             --logout-urls "https://main.${AMPLIFY_DOMAIN}/" \
             --callback-urls "https://main.${AMPLIFY_DOMAIN}/" \
             --allowed-o-auth-flows-user-pool-client
+
+      - name: (Optional) Setup machine authentication
+        run: |
+          cd deployment
+          sed -i 's/^[[:space:]]*export[[:space:]]\+AWS_PROFILE=.*/unset AWS_PROFILE/' api-machine-auth.sh 2>/dev/null || true
+          chmod +x api-machine-auth.sh
+          ./api-machine-auth.sh || echo "Machine auth setup skipped."
 
       - name: Verify deployment
         run: |
