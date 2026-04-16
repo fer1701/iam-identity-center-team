@@ -79,11 +79,11 @@ jobs:
           cd team-idc-app-temp
           # Remove all files except .git
           find . -maxdepth 1 ! -name '.git' ! -name '.' -exec rm -rf {} \;
-          # Copy new files from the GitHub workspace (the checkout)
-          cp -r ../* ./
+          # Copy new files from the GitHub workspace, excluding the temp directory itself
+          rsync -av --exclude='team-idc-app-temp' ../ ./
           # Stage all changes
           git add .
-          # Commit (if no changes, the command will exit 0)
+          # Commit if there are changes
           git commit -m "Update TEAM application [skip ci]" || echo "No changes to commit"
           # Push to main branch
           git push origin main
