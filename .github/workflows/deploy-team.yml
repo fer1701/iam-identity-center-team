@@ -1,10 +1,8 @@
-name: Deploy TEAM Application (Simplified)
+name: Update TEAM Application (Production)
 
 on:
   push:
     branches: [ "main" ]
-    paths-ignore:
-      - '.github/workflows/bootstrap-team.yml'
   workflow_dispatch:
 
 permissions:
@@ -17,7 +15,7 @@ env:
   TEAM_ACCOUNT: ${{ vars.TEAM_ACCOUNT }}
 
 jobs:
-  deploy:
+  update:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout code
@@ -47,7 +45,7 @@ jobs:
           CACHE_TTL=604800
           EOF
 
-      - name: Run init.sh
+      - name: Run init.sh (delegated admin setup)
         run: |
           cd deployment
           chmod +x init.sh
@@ -72,25 +70,14 @@ jobs:
           pipx install git-remote-codecommit
           echo "$HOME/.local/bin" >> $GITHUB_PATH
 
-      - name: Reset CodeCommit repository
+      - name: Update CodeCommit repository (push latest code)
         run: |
-          aws codecommit delete-repository --repository-name team-idc-app --region ${{ vars.AWS_REGION }} || true
-          aws codecommit create-repository --repository-name team-idc-app --region ${{ vars.AWS_REGION }}
-          rm -rf .git
-          git init -b main
           git config user.email "github-actions@github.com"
           git config user.name "GitHub Actions"
-          git add .
-          git commit -m "Initial commit"
-          git remote add origin codecommit::${{ vars.AWS_REGION }}://team-idc-app
+          git remote add origin codecommit::${{ vars.AWS_REGION }}://team-idc-app || git remote set-url origin codecommit::${{ vars.AWS_REGION }}://team-idc-app
           git push --force origin main
 
-      - name: Delete old CloudFormation stack (if exists)
-        run: |
-          aws cloudformation delete-stack --stack-name TEAM-IDC-APP --region ${{ vars.AWS_REGION }} || true
-          aws cloudformation wait stack-delete-complete --stack-name TEAM-IDC-APP --region ${{ vars.AWS_REGION }} || true
-
-      - name: Patch deploy.sh
+      - name: Patch deploy.sh (skip git commands, unset AWS_PROFILE)
         run: |
           cd deployment
           sed -i 's/^[[:space:]]*export[[:space:]]\+AWS_PROFILE=.*/unset AWS_PROFILE/' deploy.sh
@@ -99,66 +86,23 @@ jobs:
           sed -i '/git remote add origin/ s/^/#/' deploy.sh
           sed -i '/git push origin main/ s/^/#/' deploy.sh
 
-      - name: Deploy CloudFormation stack
+      - name: Update CloudFormation stack (in‑place)
         run: |
           cd deployment
           chmod +x deploy.sh
           ./deploy.sh
 
-      - name: Wait for CloudFormation stack to complete
+      - name: Configure Cognito SAML provider (using pre‑stored metadata URL)
         run: |
-          echo "Waiting for stack TEAM-IDC-APP to reach CREATE_COMPLETE state..."
-          aws cloudformation wait stack-create-complete --stack-name TEAM-IDC-APP --region ${{ vars.AWS_REGION }}
-          echo "Stack creation completed."
-
-      # ---------- Use pre‑stored SAML parameters ----------
-      - name: Configure Cognito SAML provider (using pre‑set variables)
-        run: |
-          # Wait for stack outputs to be available (max 5 minutes)
-          for i in {1..30}; do
-            USER_POOL_ID=$(aws cloudformation describe-stacks --stack-name TEAM-IDC-APP --query "Stacks[0].Outputs[?OutputKey=='UserPoolId'].OutputValue" --output text)
-            AMPLIFY_DOMAIN=$(aws cloudformation describe-stacks --stack-name TEAM-IDC-APP --query "Stacks[0].Outputs[?OutputKey=='DefaultDomain'].OutputValue" --output text)
-            if [ -n "$USER_POOL_ID" ] && [ -n "$AMPLIFY_DOMAIN" ]; then
-              break
-            fi
-            echo "Attempt $i/30: Stack outputs not ready, waiting 10 seconds..."
-            sleep 10
-          done
-
-          if [ -z "$USER_POOL_ID" ]; then
-            echo "ERROR: UserPoolId not found after waiting"
-            exit 1
-          fi
-          if [ -z "$AMPLIFY_DOMAIN" ]; then
-            echo "ERROR: DefaultDomain not found after waiting"
-            exit 1
-          fi
-
-          # Retrieve Cognito client ID (may also need retry)
-          for i in {1..20}; do
-            CLIENT_ID=$(aws cognito-idp list-user-pool-clients --user-pool-id "$USER_POOL_ID" --region ${{ vars.AWS_REGION }} --query "UserPoolClients[0].ClientId" --output text)
-            if [ -n "$CLIENT_ID" ]; then
-              break
-            fi
-            echo "Attempt $i/20: Client ID not ready, waiting 10 seconds..."
-            sleep 10
-          done
-          if [ -z "$CLIENT_ID" ]; then
-            echo "ERROR: Could not retrieve Client ID"
-            exit 1
-          fi
-
-          # Use pre‑stored SAML metadata URL
+          # Stack already exists, so outputs are available
+          USER_POOL_ID=$(aws cloudformation describe-stacks --stack-name TEAM-IDC-APP --query "Stacks[0].Outputs[?OutputKey=='UserPoolId'].OutputValue" --output text)
+          CLIENT_ID=$(aws cognito-idp list-user-pool-clients --user-pool-id "$USER_POOL_ID" --query "UserPoolClients[0].ClientId" --output text)
+          AMPLIFY_DOMAIN=$(aws cloudformation describe-stacks --stack-name TEAM-IDC-APP --query "Stacks[0].Outputs[?OutputKey=='DefaultDomain'].OutputValue" --output text)
           METADATA_URL="${{ vars.SAML_METADATA_URL }}"
-          if [ -z "$METADATA_URL" ]; then
-            echo "ERROR: SAML_METADATA_URL variable not set"
-            exit 1
-          fi
 
           PROVIDER_NAME="IAMIdentityCenter"
           EXISTS=$(aws cognito-idp list-identity-providers --user-pool-id "$USER_POOL_ID" --query "Providers[?ProviderName=='$PROVIDER_NAME'] | length(@)" --output text || echo "0")
           if [ "$EXISTS" = "0" ]; then
-            echo "Creating Cognito SAML provider..."
             aws cognito-idp create-identity-provider \
               --user-pool-id "$USER_POOL_ID" \
               --provider-name "$PROVIDER_NAME" \
@@ -167,7 +111,6 @@ jobs:
               --attribute-mapping "email=email" \
               --idp-identifiers team
           else
-            echo "Updating Cognito SAML provider..."
             aws cognito-idp update-identity-provider \
               --user-pool-id "$USER_POOL_ID" \
               --provider-name "$PROVIDER_NAME" \
@@ -175,7 +118,6 @@ jobs:
               --attribute-mapping "email=email"
           fi
 
-          echo "Updating user pool client..."
           aws cognito-idp update-user-pool-client \
             --user-pool-id "$USER_POOL_ID" \
             --client-id "$CLIENT_ID" \
@@ -186,8 +128,6 @@ jobs:
             --logout-urls "https://main.${AMPLIFY_DOMAIN}/" \
             --callback-urls "https://main.${AMPLIFY_DOMAIN}/" \
             --allowed-o-auth-flows-user-pool-client
-
-          echo "Cognito configuration completed."
 
       - name: Verify deployment
         run: |
