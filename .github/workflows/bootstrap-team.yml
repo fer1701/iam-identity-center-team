@@ -152,18 +152,26 @@ jobs:
           fi
           echo "User Pool ID: $USER_POOL_ID"
 
-          # Get the client ID for the web client (look for name containing 'clientWeb')
+          # Retrieve the actual Cognito domain (not constructed)
+          COGNITO_DOMAIN=$(aws cognito-idp describe-user-pool --user-pool-id "$USER_POOL_ID" --query "UserPool.Domain" --output text)
+          if [ -z "$COGNITO_DOMAIN" ]; then
+            echo "ERROR: No domain assigned to user pool. Creating one..."
+            aws cognito-idp create-user-pool-domain --user-pool-id "$USER_POOL_ID" --domain "team-idc-app-$RANDOM"
+            COGNITO_DOMAIN=$(aws cognito-idp describe-user-pool --user-pool-id "$USER_POOL_ID" --query "UserPool.Domain" --output text)
+          fi
+          echo "Cognito domain: $COGNITO_DOMAIN"
+
+          # Get the client ID for the web client
           CLIENT_ID=$(aws cognito-idp list-user-pool-clients --user-pool-id "$USER_POOL_ID" --region ${{ vars.AWS_REGION }} --query "UserPoolClients[?contains(ClientName, 'clientWeb')].ClientId" --output text)
           if [ -z "$CLIENT_ID" ]; then
             CLIENT_ID=$(aws cognito-idp list-user-pool-clients --user-pool-id "$USER_POOL_ID" --region ${{ vars.AWS_REGION }} --query "UserPoolClients[0].ClientId" --output text)
           fi
           echo "Client ID: $CLIENT_ID"
 
-          # Build SAML URLs
-          COGNITO_DOMAIN="${USER_POOL_ID}.auth.${{ vars.AWS_REGION }}.amazoncognito.com"
+          # Build SAML URLs using the actual Cognito domain
           REDIRECT_URI="https://main.${AMPLIFY_DOMAIN}/"
-          START_URL="https://${COGNITO_DOMAIN}/authorize?client_id=${CLIENT_ID}&response_type=code&scope=aws.cognito.signin.user.admin+email+openid+phone+profile&redirect_uri=${REDIRECT_URI}&idp_identifier=team"
-          ACS_URL="https://${COGNITO_DOMAIN}/saml2/idpresponse"
+          START_URL="https://${COGNITO_DOMAIN}.auth.${{ vars.AWS_REGION }}.amazoncognito.com/authorize?client_id=${CLIENT_ID}&response_type=code&scope=aws.cognito.signin.user.admin+email+openid+phone+profile&redirect_uri=${REDIRECT_URI}&idp_identifier=team"
+          ACS_URL="https://${COGNITO_DOMAIN}.auth.${{ vars.AWS_REGION }}.amazoncognito.com/saml2/idpresponse"
           AUDIENCE="urn:amazon:cognito:sp:${USER_POOL_ID}"
 
           echo "================================================"
