@@ -182,4 +182,4 @@ jobs:
           echo "================================================"
           echo "Also create the SAML app in IAM Identity Center using these three URLs,"
           echo "then store its metadata URL as SAML_METADATA_URL."
-          echo "================================================"
+          echo "================================================" 
