@@ -25,9 +25,8 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
         with:
-          fetch-depth: 0   # full history, not shallow
+          fetch-depth: 0
 
-      # ---------- Role A (management) for init.sh ----------
       - name: Configure AWS credentials (Role A)
         uses: aws-actions/configure-aws-credentials@v4
         with:
@@ -59,7 +58,6 @@ jobs:
           sed -i 's/^[[:space:]]*export[[:space:]]\+AWS_PROFILE=.*/unset AWS_PROFILE/' init.sh
           ./init.sh
 
-      # ---------- Assume Role B (TEAM account) ----------
       - name: Assume Role B
         run: |
           CREDS=$(aws sts assume-role \
@@ -78,24 +76,17 @@ jobs:
           pipx install git-remote-codecommit
           echo "$HOME/.local/bin" >> $GITHUB_PATH
 
-      # ---------- Sync CodeCommit repository with GitHub fork ----------
       - name: Sync CodeCommit repository (reset --hard)
         run: |
           git config user.email "github-actions@github.com"
           git config user.name "GitHub Actions"
-          # Clone the existing CodeCommit repository (full history)
           git clone codecommit::${{ vars.AWS_REGION }}://team-idc-app team-idc-app-codecommit
           cd team-idc-app-codecommit
-          # Add the GitHub repository as a remote
           git remote add github https://github.com/${{ github.repository }}.git
-          # Fetch the latest from GitHub main branch
           git fetch github main
-          # Reset the local branch to exactly match GitHub main (overwrites CodeCommit history)
           git reset --hard github/main
-          # Push the updated code back to CodeCommit (force push)
           git push --force origin main
 
-      # ---------- Patch deploy.sh (skip git commands, unset AWS_PROFILE) ----------
       - name: Patch deploy.sh
         run: |
           cd deployment
@@ -105,14 +96,12 @@ jobs:
           sed -i '/git remote add origin/ s/^/#/' deploy.sh
           sed -i '/git push origin main/ s/^/#/' deploy.sh
 
-      # ---------- Update CloudFormation stack (in‑place) ----------
       - name: Update CloudFormation stack (in‑place)
         run: |
           cd deployment
           chmod +x deploy.sh
           ./deploy.sh
 
-      # ---------- Configure Cognito SAML provider (using pre‑stored metadata URL) ----------
       - name: Configure Cognito SAML provider
         run: |
           # Retrieve Cognito details from the existing stack
@@ -120,7 +109,13 @@ jobs:
           if [ -z "$USER_POOL_ID" ]; then
             USER_POOL_ID=$(aws cognito-idp list-user-pools --max-results 20 --region ${{ vars.AWS_REGION }} --query "UserPools[?contains(Name, 'team06dbb7fc')].Id" --output text)
           fi
-          CLIENT_ID=$(aws cognito-idp list-user-pool-clients --user-pool-id "$USER_POOL_ID" --query "UserPoolClients[0].ClientId" --output text)
+
+          # FIX: Get the web client ID (prefer client name containing 'clientWeb')
+          CLIENT_ID=$(aws cognito-idp list-user-pool-clients --user-pool-id "$USER_POOL_ID" --region ${{ vars.AWS_REGION }} --query "UserPoolClients[?contains(ClientName, 'clientWeb')].ClientId" --output text)
+          if [ -z "$CLIENT_ID" ]; then
+            CLIENT_ID=$(aws cognito-idp list-user-pool-clients --user-pool-id "$USER_POOL_ID" --region ${{ vars.AWS_REGION }} --query "UserPoolClients[0].ClientId" --output text)
+          fi
+
           AMPLIFY_DOMAIN=$(aws cloudformation describe-stacks --stack-name TEAM-IDC-APP --query "Stacks[0].Outputs[?OutputKey=='DefaultDomain'].OutputValue" --output text)
 
           METADATA_URL="${{ vars.SAML_METADATA_URL }}"
