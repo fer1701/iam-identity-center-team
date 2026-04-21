@@ -134,15 +134,6 @@ jobs:
             sleep 30
           done
 
-      - name: Set Amplify environment variable to use 'email' attribute
-        run: |
-          APP_ID=$(aws amplify list-apps --query "apps[?name=='TEAM-IDC-APP'].appId" --output text)
-          aws amplify update-app --app-id $APP_ID --environment-variables "REACT_APP_USER_ATTRIBUTE=email" --region ${{ vars.AWS_REGION }}
-          # Force a new build to apply the change
-          aws amplify start-job --app-id $APP_ID --branch-name main --job-type RELEASE --region ${{ vars.AWS_REGION }}
-          echo "Waiting for new build to complete..."
-          sleep 10
-
       - name: Retrieve and print SAML URLs
         run: |
           # Get Amplify domain from stack output
