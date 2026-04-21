@@ -137,7 +137,7 @@ jobs:
               --user-pool-id "$USER_POOL_ID" \
               --provider-name "$PROVIDER_NAME" \
               --provider-details "MetadataURL=$METADATA_URL" \
-              --attribute-mapping "email=email"
+              --attribute-mapping "email=Email"
           fi
 
           aws cognito-idp update-user-pool-client \
