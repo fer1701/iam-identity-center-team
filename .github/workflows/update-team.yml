@@ -119,7 +119,7 @@ jobs:
           AMPLIFY_DOMAIN=$(aws cloudformation describe-stacks --stack-name TEAM-IDC-APP --query "Stacks[0].Outputs[?OutputKey=='DefaultDomain'].OutputValue" --output text)
 
           METADATA_URL="${{ vars.SAML_METADATA_URL }}"
-          PROVIDER_NAME="IDC"
+          PROVIDER_NAME="idc"
 
           EXISTS=$(aws cognito-idp list-identity-providers --user-pool-id "$USER_POOL_ID" --query "Providers[?ProviderName=='$PROVIDER_NAME'] | length(@)" --output text || echo "0")
           if [ "$EXISTS" = "0" ]; then
