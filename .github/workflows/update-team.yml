@@ -129,7 +129,7 @@ jobs:
               --provider-name "$PROVIDER_NAME" \
               --provider-type SAML \
               --provider-details "MetadataURL=$METADATA_URL" \
-              --attribute-mapping "email=email" \
+              --attribute-mapping "email=Email" \
               --idp-identifiers team
           else
             echo "Updating Cognito SAML provider..."
