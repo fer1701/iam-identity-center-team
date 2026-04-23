@@ -205,9 +205,13 @@ jobs:
 
           [[ -n "${{ vars.SAML_METADATA_URL }}" ]] || { echo "Missing vars.SAML_METADATA_URL"; exit 1; }
 
-          USER_POOL_ID="$(aws cloudformation describe-stacks --stack-name TEAM-IDC-APP --region "${AWS_REGION}" \
-            --query "Stacks[0].Outputs[?OutputKey=='UserPoolId'].OutputValue" --output text)"
-          [[ -n "${USER_POOL_ID}" && "${USER_POOL_ID}" != "None" ]] || { echo "UserPoolId not found"; exit 1; }
+          # Discover the TEAM user pool by name (stack does not output UserPoolId)
+          USER_POOL_ID="$(aws cognito-idp list-user-pools \
+            --max-results 60 \
+            --region "${AWS_REGION}" \
+            --query "UserPools[?contains(Name, 'team06dbb7fc')].Id | [0]" \
+            --output text)"
+          [[ -n "${USER_POOL_ID}" && "${USER_POOL_ID}" != "None" ]] || { echo "UserPoolId not found via list-user-pools"; exit 1; }
 
           CLIENT_ID="$(aws cognito-idp list-user-pool-clients --user-pool-id "${USER_POOL_ID}" --region "${AWS_REGION}" \
             --query "UserPoolClients[?contains(ClientName, 'clientWeb')].ClientId | [0]" --output text)"
