@@ -72,8 +72,9 @@ jobs:
         run: |
           set -euo pipefail
           cd deployment
+          sed -i 's/^[[:space:]]*export[[:space:]]\+AWS_PROFILE=.*/unset AWS_PROFILE/' init.sh
           chmod +x init.sh
-          env -u AWS_PROFILE ./init.sh
+          ./init.sh
 
       - name: Install git-remote-codecommit
         shell: bash
@@ -102,8 +103,9 @@ jobs:
         run: |
           set -euo pipefail
           cd deployment
+          sed -i 's/^[[:space:]]*export[[:space:]]\+AWS_PROFILE=.*/unset AWS_PROFILE/' deploy.sh
           chmod +x deploy.sh
-          env -u AWS_PROFILE ./deploy.sh
+          ./deploy.sh
 
       - name: Wait for CloudFormation update to complete
         shell: bash
@@ -132,7 +134,7 @@ jobs:
           [[ -n "${AMPLIFY_DOMAIN}" && "${AMPLIFY_DOMAIN}" != "None" ]] || { echo "DefaultDomain not found"; exit 1; }
 
           METADATA_URL="${{ vars.SAML_METADATA_URL }}"
-          DESIRED_PROVIDER_NAME="IDC"
+          DESIRED_PROVIDER_NAME="idc"
           IDP_IDENTIFIER="team"
 
           # Detect current provider that already owns idp-identifier "team"
