@@ -39,7 +39,6 @@ jobs:
           role-to-assume: arn:aws:iam::${{ vars.MANAGEMENT_ACCOUNT }}:role/GitHubActions-TEAM-RoleA
           aws-region: ${{ vars.AWS_REGION }}
 
-      
       - name: Generate parameters.sh
         shell: bash
         run: |
@@ -69,6 +68,14 @@ jobs:
           chmod +x init.sh
           ./init.sh
 
+      - name: Configure AWS credentials (Role B via role chaining)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.TEAM_ROLE_B_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+          role-chaining: true
+          role-skip-session-tagging: true
+
       - name: Install git-remote-codecommit
         shell: bash
         run: |
@@ -90,15 +97,6 @@ jobs:
           git fetch github main
           git reset --hard github/main
           git push --force origin main
-
-      - name: Configure AWS credentials (Role B via role chaining)
-        uses: aws-actions/configure-aws-credentials@v4
-        with:
-          role-to-assume: ${{ vars.TEAM_ROLE_B_ARN }}
-          aws-region: ${{ vars.AWS_REGION }}
-          role-chaining: true
-          role-skip-session-tagging: true
-
 
       - name: Patch deploy.sh
         run: |
