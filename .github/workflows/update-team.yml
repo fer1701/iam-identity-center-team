@@ -45,6 +45,7 @@ jobs:
           role-to-assume: ${{ vars.TEAM_ROLE_B_ARN }}
           aws-region: ${{ vars.AWS_REGION }}
           role-chaining: true
+          role-skip-session-tagging: true
 
       - name: Generate parameters.sh
         shell: bash
