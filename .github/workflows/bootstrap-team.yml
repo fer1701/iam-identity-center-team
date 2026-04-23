@@ -90,12 +90,13 @@ jobs:
           set -euo pipefail
           git config user.email "github-actions@github.com"
           git config user.name "GitHub Actions"
-
-          git remote remove codecommit 2>/dev/null || true
-          git remote add codecommit "codecommit::${AWS_REGION}://team-idc-app"
-
-          git fetch origin main
-          git push --force codecommit origin/main:main
+          
+          git clone "codecommit::${AWS_REGION}://team-idc-app" team-idc-mirror
+          cd team-idc-mirror
+          git remote add github "https://github.com/${{ github.repository }}.git"
+          git fetch github main
+          git reset --hard github/main
+          git push --force origin main
 
       - name: Patch deploy.sh for CI (disable AWS_PROFILE / CodeCommit)
         shell: bash
