@@ -39,14 +39,7 @@ jobs:
           role-to-assume: arn:aws:iam::${{ vars.MANAGEMENT_ACCOUNT }}:role/GitHubActions-TEAM-RoleA
           aws-region: ${{ vars.AWS_REGION }}
 
-      - name: Configure AWS credentials (Role B via role chaining)
-        uses: aws-actions/configure-aws-credentials@v4
-        with:
-          role-to-assume: ${{ vars.TEAM_ROLE_B_ARN }}
-          aws-region: ${{ vars.AWS_REGION }}
-          role-chaining: true
-          role-skip-session-tagging: true
-
+      
       - name: Generate parameters.sh
         shell: bash
         run: |
@@ -98,6 +91,15 @@ jobs:
           git reset --hard github/main
           git push --force origin main
 
+      - name: Configure AWS credentials (Role B via role chaining)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.TEAM_ROLE_B_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+          role-chaining: true
+          role-skip-session-tagging: true
+
+
       - name: Patch deploy.sh
         run: |
           cd deployment
@@ -145,14 +147,16 @@ jobs:
               ;;
           esac
 
-      - name: Wait for Amplify build to SUCCEED (timeout = 30m)
+      - name: Wait for Amplify build to finish (and surface logs)
         shell: bash
         run: |
           set -euo pipefail
+      
           APP_ID="$(aws cloudformation describe-stacks \
             --stack-name TEAM-IDC-APP \
             --region "${AWS_REGION}" \
             --query "Stacks[0].Outputs[?OutputKey=='AppId'].OutputValue" --output text)"
+      
           if [[ -z "${APP_ID}" || "${APP_ID}" == "None" ]]; then
             APP_ID="$(aws amplify list-apps \
               --region "${AWS_REGION}" \
@@ -160,23 +164,39 @@ jobs:
               --output text)"
           fi
           [[ -n "${APP_ID}" && "${APP_ID}" != "None" ]] || { echo "Amplify AppId not found"; exit 1; }
-          deadline=$((SECONDS+1800))
+      
+          # Capture the latest jobId once, then track it deterministically
+          JOB_ID="$(aws amplify list-jobs --app-id "${APP_ID}" --branch-name main --max-items 1 --region "${AWS_REGION}" \
+            --query "jobSummaries[0].jobId" --output text)"
+          [[ -n "${JOB_ID}" && "${JOB_ID}" != "None" ]] || { echo "Amplify jobId not found"; exit 1; }
+      
+          echo "Tracking Amplify jobId=${JOB_ID} for appId=${APP_ID}"
+      
+          deadline=$((SECONDS+3600))
           while (( SECONDS < deadline )); do
-            JOB_JSON="$(aws amplify list-jobs --app-id "${APP_ID}" --branch-name main --max-items 1 --region "${AWS_REGION}" --output json)"
-            STATUS="$(jq -r '.jobSummaries[0].status // "UNKNOWN"' <<< "${JOB_JSON}")"
-            JOB_ID="$(jq -r '.jobSummaries[0].jobId // "UNKNOWN"' <<< "${JOB_JSON}")"
-            echo "Amplify latest job: ${JOB_ID} status=${STATUS}"
-            case "${STATUS}" in
+            job="$(aws amplify get-job --app-id "${APP_ID}" --branch-name main --job-id "${JOB_ID}" --region "${AWS_REGION}" --output json)"
+            status="$(jq -r '.job.summary.status // "UNKNOWN"' <<< "${job}")"
+            reason="$(jq -r '.job.steps[]? | select(.stepName=="BUILD") | .statusReason // empty' <<< "${job}" | head -n 1)"
+            buildLogUrl="$(jq -r '.job.steps[]? | select(.stepName=="BUILD") | .logUrl // empty' <<< "${job}" | head -n 1)"
+      
+            echo "Amplify job ${JOB_ID} status=${status}"
+            aws amplify get-job --app-id "${APP_ID}" --branch-name main --job-id "${JOB_ID}" --region "${AWS_REGION}" \
+              --query "job.steps[].{name:stepName,status:status,start:startTime,end:endTime,statusReason:statusReason}" --output table || true
+      
+            case "${status}" in
               SUCCEED) exit 0 ;;
               FAILED|CANCELLED)
-                echo "Amplify build failed."
+                echo "Amplify job failed: ${status}"
+                [[ -n "${reason}" ]] && echo "BUILD statusReason: ${reason}"
+                [[ -n "${buildLogUrl}" ]] && echo "BUILD logUrl: ${buildLogUrl}"
                 exit 1
                 ;;
               *) sleep 20 ;;
             esac
           done
-          echo "Timed out waiting for Amplify build to succeed."
-          exit 1    
+      
+          echo "Timed out waiting for Amplify job ${JOB_ID} to finish."
+          exit 1
       
       - name: Configure Cognito SAML provider + client (robust/idempotent)
         shell: bash
