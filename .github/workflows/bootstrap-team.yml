@@ -88,15 +88,20 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          git config user.email "github-actions@github.com"
-          git config user.name "GitHub Actions"
-          
+          git config --global user.email "github-actions@github.com"
+          git config --global user.name "GitHub Actions"
+      
+          # Empty CodeCommit repos often default to 'master' with no 'main' — so create 'main' explicitly
           git clone "codecommit::${AWS_REGION}://team-idc-app" team-idc-mirror
           cd team-idc-mirror
-          git remote add github "https://github.com/${{ github.repository }}.git"
-          git fetch github main
-          git reset --hard github/main
-          git push --force origin main
+      
+          git remote add github "https://github.com/${{ github.repository }}.git" 2>/dev/null || true
+          git fetch github
+      
+          # Ensure local 'main' exists and matches GitHub main
+          git checkout -B main "refs/remotes/github/main"
+      
+          git push -u --force origin refs/heads/main:refs/heads/main
 
       - name: Patch deploy.sh for CI (disable AWS_PROFILE / CodeCommit)
         shell: bash
