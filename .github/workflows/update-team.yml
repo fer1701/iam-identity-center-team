@@ -98,12 +98,20 @@ jobs:
           git reset --hard github/main
           git push --force origin main
 
+      - name: Patch deploy.sh
+        run: |
+          cd deployment
+          sed -i 's/^[[:space:]]*export[[:space:]]\+AWS_PROFILE=.*/unset AWS_PROFILE/' deploy.sh
+          sed -i '/aws codecommit create-repository/ s/^/#/' deploy.sh
+          sed -i '/git remote remove origin/ s/^/#/' deploy.sh
+          sed -i '/git remote add origin/ s/^/#/' deploy.sh
+          sed -i '/git push origin main/ s/^/#/' deploy.sh
+
       - name: Deploy (CloudFormation update)
         shell: bash
         run: |
           set -euo pipefail
           cd deployment
-          sed -i 's/^[[:space:]]*export[[:space:]]\+AWS_PROFILE=.*/unset AWS_PROFILE/' deploy.sh
           chmod +x deploy.sh
           ./deploy.sh
 
