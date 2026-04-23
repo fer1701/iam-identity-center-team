@@ -115,13 +115,69 @@ jobs:
           chmod +x deploy.sh
           ./deploy.sh
 
-      - name: Wait for CloudFormation update to complete
+      - name: Wait for CloudFormation to settle (no hang on no-op)
         shell: bash
         run: |
           set -euo pipefail
-          aws cloudformation wait stack-update-complete --stack-name TEAM-IDC-APP --region "${AWS_REGION}" \
-            || aws cloudformation wait stack-create-complete --stack-name TEAM-IDC-APP --region "${AWS_REGION}"
+          status="$(aws cloudformation describe-stacks \
+            --stack-name TEAM-IDC-APP \
+            --region "${AWS_REGION}" \
+            --query "Stacks[0].StackStatus" --output text)"
+          echo "Current stack status: ${status}"
+          case "${status}" in
+            *_IN_PROGRESS)
+              # Try update waiter first; if this was a create, it will fail quickly and then create waiter will work.
+              aws cloudformation wait stack-update-complete --stack-name TEAM-IDC-APP --region "${AWS_REGION}" \
+                || aws cloudformation wait stack-create-complete --stack-name TEAM-IDC-APP --region "${AWS_REGION}"
+              ;;
+            *_COMPLETE)
+              echo "Stack already complete: ${status}"
+              ;;
+            *)
+              echo "Stack in failure/unknown terminal state: ${status}"
+              aws cloudformation describe-stack-events \
+                --stack-name TEAM-IDC-APP \
+                --region "${AWS_REGION}" \
+                --max-items 30 \
+                --query "StackEvents[].[Timestamp,LogicalResourceId,ResourceType,ResourceStatus,ResourceStatusReason]" \
+                --output table
+              exit 1
+              ;;
+          esac
 
+      - name: Wait for Amplify build to SUCCEED (timeout = 30m)
+        shell: bash
+        run: |
+          set -euo pipefail
+          APP_ID="$(aws cloudformation describe-stacks \
+            --stack-name TEAM-IDC-APP \
+            --region "${AWS_REGION}" \
+            --query "Stacks[0].Outputs[?OutputKey=='AppId'].OutputValue" --output text)"
+          if [[ -z "${APP_ID}" || "${APP_ID}" == "None" ]]; then
+            APP_ID="$(aws amplify list-apps \
+              --region "${AWS_REGION}" \
+              --query "apps[?name=='TEAM-IDC-APP'].appId | [0]" \
+              --output text)"
+          fi
+          [[ -n "${APP_ID}" && "${APP_ID}" != "None" ]] || { echo "Amplify AppId not found"; exit 1; }
+          deadline=$((SECONDS+1800))
+          while (( SECONDS < deadline )); do
+            JOB_JSON="$(aws amplify list-jobs --app-id "${APP_ID}" --branch-name main --max-items 1 --region "${AWS_REGION}" --output json)"
+            STATUS="$(jq -r '.jobSummaries[0].status // "UNKNOWN"' <<< "${JOB_JSON}")"
+            JOB_ID="$(jq -r '.jobSummaries[0].jobId // "UNKNOWN"' <<< "${JOB_JSON}")"
+            echo "Amplify latest job: ${JOB_ID} status=${STATUS}"
+            case "${STATUS}" in
+              SUCCEED) exit 0 ;;
+              FAILED|CANCELLED)
+                echo "Amplify build failed."
+                exit 1
+                ;;
+              *) sleep 20 ;;
+            esac
+          done
+          echo "Timed out waiting for Amplify build to succeed."
+          exit 1    
+      
       - name: Configure Cognito SAML provider + client (robust/idempotent)
         shell: bash
         run: |
@@ -197,23 +253,25 @@ jobs:
             --allowed-o-auth-flows-user-pool-client \
             --region "${AWS_REGION}"
 
-      - name: Verify front-end is reachable and sane
+      - name: Verify TEAM URL is reachable and sane
         shell: bash
         run: |
           set -euo pipefail
-          APP_URL="$(aws amplify list-apps --region "${AWS_REGION}" --query "apps[?name=='TEAM-IDC-APP'].defaultDomain | [0]" --output text)"
+          APP_URL="$(aws amplify list-apps \
+            --region "${AWS_REGION}" \
+            --query "apps[?name=='TEAM-IDC-APP'].defaultDomain | [0]" \
+            --output text)"
           [[ -n "${APP_URL}" && "${APP_URL}" != "None" ]] || { echo "Could not determine app URL"; exit 1; }
           URL="https://main.${APP_URL}/"
-
-          deadline=$((SECONDS+900))
+          echo "Checking ${URL}"
+          deadline=$((SECONDS+600))
           while (( SECONDS < deadline )); do
             body="$(curl -fsSL "${URL}" || true)"
             if [[ -n "${body}" ]] && grep -qiE "TEAM|aws-amplify|<html" <<< "${body}"; then
-              echo "TEAM application appears online at ${URL}"
+              echo "TEAM application appears online."
               exit 0
             fi
             sleep 10
           done
-
           echo "TEAM did not become ready at ${URL}"
           exit 1
