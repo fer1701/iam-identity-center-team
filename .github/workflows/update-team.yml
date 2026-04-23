@@ -163,10 +163,12 @@ jobs:
           fi
           [[ -n "${APP_ID}" && "${APP_ID}" != "None" ]] || { echo "Amplify AppId not found"; exit 1; }
       
-          # Capture the latest jobId once, then track it deterministically
-          JOB_ID="$(aws amplify list-jobs --app-id "${APP_ID}" --branch-name main --max-items 1 --region "${AWS_REGION}" \
-            --query "jobSummaries[0].jobId" --output text)"
-          [[ -n "${JOB_ID}" && "${JOB_ID}" != "None" ]] || { echo "Amplify jobId not found"; exit 1; }
+          # Robust jobId extraction
+          JOB_ID="$(aws amplify list-jobs --app-id "${APP_ID}" --branch-name main --max-items 1 --region "${AWS_REGION}" --output json \
+            | jq -r '.jobSummaries[0].jobId // empty')"
+      
+          [[ -n "${JOB_ID}" ]] || { echo "Amplify jobId not found"; exit 1; }
+          [[ "${JOB_ID}" =~ ^[0-9]+$ ]] || { echo "Invalid jobId: '${JOB_ID}'"; exit 1; }
       
           echo "Tracking Amplify jobId=${JOB_ID} for appId=${APP_ID}"
       
