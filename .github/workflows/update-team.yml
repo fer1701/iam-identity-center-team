@@ -235,20 +235,20 @@ jobs:
             | .[0] // empty
           ' <<< "${providers}")"
 
-          # Prefer updating an existing provider named IDC if it exists; else update/create safely.
-          exists_idc="$(jq -r '.Providers | map(select(.ProviderName=="IDC")) | length' <<< "${providers}")"
+          # Prefer updating an existing provider named idc if it exists; else update/create safely.
+          exists_idc="$(jq -r '.Providers | map(select(.ProviderName=="idc")) | length' <<< "${providers}")"
 
           if [[ "${exists_idc}" -gt 0 ]]; then
-            echo "Updating existing IdP: IDC"
+            echo "Updating existing IdP: idc"
             aws cognito-idp update-identity-provider \
               --user-pool-id "${USER_POOL_ID}" \
-              --provider-name "IDC" \
+              --provider-name "idc" \
               --provider-details "MetadataURL=${METADATA_URL}" \
               --attribute-mapping "email=Email" \
               --region "${AWS_REGION}"
-            provider_for_client="IDC"
+            provider_for_client="idc"
           else
-            echo "IDC provider not found; attempting create."
+            echo "idc provider not found; attempting create."
             # If "team" is already associated to IAMIdentityCenter/other, create will fail; surface a clear message.
             aws cognito-idp create-identity-provider \
               --user-pool-id "${USER_POOL_ID}" \
